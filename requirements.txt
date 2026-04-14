@@ -1,0 +1,51 @@
+# Core data science
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+
+# Kite Connect API (step03 — OHLCV data fetching)
+kiteconnect>=4.0
+
+# Technical indicators (step04)
+ta>=0.10
+
+# FinBERT sentiment (step05)
+transformers>=4.30
+torch>=2.0
+
+# Causal discovery (step09)
+linearmodels>=5.0       # PanelOLS for panel Granger causality
+statsmodels>=0.14       # Durbin-Watson, AIC, OLS
+
+# Knowledge graph (steps 10, 11, 13, 15)
+neo4j>=5.0
+
+# Macro data — global indices (step06)
+yfinance>=0.2.18
+
+# ML models (steps 13, 14b, 16)
+xgboost>=1.7
+scikit-learn>=1.2
+
+# Explainable ML (step15)
+shap>=0.42
+
+# Graph Neural Networks (step13b — GPU recommended)
+# Install separately with CUDA support:
+#   pip install torch-geometric torch-sparse torch-scatter
+# torch-geometric>=2.3
+
+# Clustering (step16c)
+hdbscan>=0.8.33
+
+# Visualization
+matplotlib>=3.7
+seaborn>=0.12
+networkx>=3.0
+
+# Utilities
+tqdm>=4.65
+requests>=2.28
+
+# Environment variables
+python-dotenv>=1.0

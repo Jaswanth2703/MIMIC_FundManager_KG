@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(python -c ':*)",
+      "Bash(python step12b_novel_metrics.py)",
+      "Bash(grep -n \"\\\\\\\\\\\\\\\\u\\\\|→\\\\|←\\\\|≥\\\\|≤\\\\|×\\\\|→\\\\|—\\\\|–\" \"/c/Users/koden/Desktop/Final_year_project/MIMIC_FundManager_KG/step09_targeted_pannel.py\")"
+    ]
+  }
+}
