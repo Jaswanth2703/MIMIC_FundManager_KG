@@ -1,16 +1,20 @@
 """
-Step 09a -- ICP v6 (IMPROVED)
-Robust invariance test (KS) + soft intersection (>90%) + multi-alpha sweep
-+ continuous MI + temporal environments + no arbitrary domain bonus
+Step 09a -- ICP v7 (Markov Blanket + Rich Environments)
+=======================================================
+Proper Markov Blanket discovery + rich environments + expanded candidates
 
-Improvements over v5:
-- KS test replaces Levene+ANOVA (distributional equality, not just variance)
-- Soft intersection: variables in >90% of plausible sets (was: strict ALL)
-- Multi-alpha sensitivity sweep: alpha in [0.05, 0.10, 0.15, 0.20]
-- Continuous MI via mutual_info_regression (was: classification MI on ordinal)
-- Temporal environments added (pre/post rate hike, volatility regimes)
-- DOMAIN_BONUS removed (was unjustified arbitrary boost)
-- Partial correlation for candidate screening alongside MI
+v7 improvements over v6:
+- Grow-Shrink Markov Blanket: discovers parents + children + co-parents
+  using conditional independence tests (partial correlation)
+- Rich environments: quarter-based temporal + sector + momentum regime
+  (15-25 environments instead of 2-4)
+- Expanded candidate pool: MB variables + interactions + domain (50 max)
+- Soft intersection threshold relaxed to 80% for better discovery
+- ICP now has statistical power to find invariant causal parents
+
+Reference:
+  Peters et al. (2016). Causal inference using invariant prediction.
+  JRSS-B, 78(5), 947-1012.
 """
 
 import sys, os, json, warnings
@@ -32,6 +36,7 @@ from config import FEATURES_DIR, CAUSAL_DIR
 INPUT_CSV      = os.path.join(FEATURES_DIR, 'LPCMCI_READY.csv')
 OUTPUT_PARENTS = os.path.join(CAUSAL_DIR, 'icp_causal_parents.csv')
 OUTPUT_DIAG    = os.path.join(CAUSAL_DIR, 'icp_environment_diagnostics.json')
+OUTPUT_MB      = os.path.join(CAUSAL_DIR, 'markov_blanket.json')
 
 ACTION_MAP = {
     'BUY': 2, 'INCREASE': 2, 'INITIAL_POSITION': 2,
@@ -39,14 +44,14 @@ ACTION_MAP = {
     'DECREASE': 0, 'SELL': 0,
 }
 
-# ---- IMPROVED SETTINGS ----
-ALPHA_SWEEP           = [0.05, 0.10, 0.15, 0.20]  # multi-alpha sensitivity
-ALPHA_PRIMARY         = 0.10                         # primary alpha
+# ---- IMPROVED SETTINGS (v7) ----
+ALPHA_SWEEP           = [0.05, 0.10, 0.15, 0.20]
+ALPHA_PRIMARY         = 0.10
 MAX_SUBSET_SIZE       = 4
-CANDIDATES_PER_PASS   = 20
-MAX_CANDIDATES_FINAL  = 25
-SOFT_INTERSECTION_PCT = 0.90   # variable must appear in >90% of plausible sets
-MIN_PER_ENV           = 200
+CANDIDATES_PER_PASS   = 25      # v7: up from 20
+MAX_CANDIDATES_FINAL  = 50      # v7: up from 25
+SOFT_INTERSECTION_PCT = 0.80    # v7: relaxed from 0.90
+MIN_PER_ENV           = 150     # v7: reduced from 200
 
 EXCLUDE = {
     'action_ordinal', 'is_buy', 'is_sell',
@@ -73,47 +78,63 @@ DOMAIN_FEATURES = [
     'holding_tenure', 'allocation_change_lag1', 'allocation_change_lag2',
     'pct_nav_lag1', 'pct_nav_lag2', 'volume_ratio',
     'rsi_lag1', 'macd_line_lag1', 'volatility_3m', 'momentum_3m',
+    # v7: interaction features
+    'pe_x_momentum', 'rsi_x_momentum', 'vix_x_return',
+    'sentiment_x_momentum', 'alloc_x_sentiment',
+    # v7: non-linear transforms
+    'log_market_cap', 'log_pe', 'sqrt_volatility', 'log_volume_ratio',
+    # v7: key raw features
+    'monthly_return', 'monthly_return_lag1', 'monthly_return_lag2',
 ]
 
 
 def build_environments(df):
-    """Build environment labels for ICP.
+    """Build rich environment labels for ICP.
 
-    v6: Added temporal environments alongside structural ones:
-    - Fund_Type × nifty_regime (original)
-    - VIX regime (high/low volatility)
-    - Temporal period (early/late in sample)
-    This gives richer environment variation for better invariance testing.
+    v7: Redesigned for 15-25 diverse environments (was 2-4).
+    Uses orthogonal dimensions that create genuine distributional shifts:
+    - Quarter-of-year (Q1-Q4): seasonal patterns in fund behavior
+    - Market momentum regime (bull/bear/sideways): different return environments
+    - Temporal half (early/late): structural change over time
+
+    This gives ~24 potential environments (4 × 3 × 2), filtered to those
+    with >=MIN_PER_ENV observations.
     """
     parts = []
 
-    # Structural: Fund_Type
-    if 'Fund_Type' in df.columns:
-        stratum = df['Fund_Type'].astype(str).str.strip().str.lower()
-        stratum = stratum.replace({'small cap': 'small', 'mid cap': 'mid'})
+    # Dimension 1: Quarter of year (Q1-Q4) — seasonal behavior
+    if 'year_month_str' in df.columns:
+        months = pd.to_datetime(df['year_month_str'], errors='coerce')
+        quarter = months.dt.quarter.fillna(1).astype(int)
+        quarter_label = quarter.map({1: 'Q1', 2: 'Q2', 3: 'Q3', 4: 'Q4'})
+        parts.append(quarter_label)
     else:
-        stratum = pd.Series('pooled', index=df.index)
-    parts.append(stratum)
+        parts.append(pd.Series('qX', index=df.index))
 
-    # Market regime: nifty50 return
+    # Dimension 2: Market momentum regime (return-based)
     if 'nifty50_return' in df.columns:
         ret = df['nifty50_return'].fillna(0)
         regime = pd.cut(ret, bins=[-1e9, -0.02, 0.02, 1e9],
-                        labels=['bear', 'sideways', 'bull']).astype(str)
+                        labels=['bear', 'flat', 'bull']).astype(str)
     else:
         regime = pd.Series('any', index=df.index)
     parts.append(regime)
 
-    # v6: VIX regime (high/low volatility)
-    if 'india_vix_close' in df.columns:
-        vix = df['india_vix_close'].fillna(df['india_vix_close'].median())
-        vix_med = vix.median()
-        vix_regime = pd.Series(np.where(vix > vix_med, 'hvix', 'lvix'), index=df.index)
-        parts.append(vix_regime)
+    # Dimension 3: Temporal half (structural change)
+    if 'year_month_str' in df.columns:
+        all_months = sorted(df['year_month_str'].dropna().unique())
+        mid = all_months[len(all_months) // 2] if all_months else '2024-01'
+        temporal = pd.Series(
+            np.where(df['year_month_str'] <= mid, 'early', 'late'),
+            index=df.index
+        )
+    else:
+        temporal = pd.Series('any', index=df.index)
+    parts.append(temporal)
 
-    env = parts[0]
+    env = parts[0].astype(str)
     for p in parts[1:]:
-        env = env + '__' + p
+        env = env + '__' + p.astype(str)
     return env
 
 
@@ -132,12 +153,98 @@ def _pool(df):
     return [c for c in num if c not in EXCLUDE and not c.endswith('_lag3')]
 
 
-def build_candidate_pool(df, target_col):
-    """Build candidate pool using correlation + continuous MI.
+# ============================================================
+# Grow-Shrink Markov Blanket Discovery
+# ============================================================
+def _partial_corr(x, y, Z, df):
+    """Partial correlation between x and y given Z using OLS residuals."""
+    if len(Z) == 0:
+        vals = df[[x, y]].dropna()
+        if len(vals) < 30 or vals[x].std() < 1e-9 or vals[y].std() < 1e-9:
+            return 0.0, 1.0
+        r, p = stats.pearsonr(vals[x], vals[y])
+        return r, p
 
-    v6: Uses mutual_info_regression (continuous) instead of
-    mutual_info_classif (classification). No arbitrary DOMAIN_BONUS.
-    Domain features get a small tiebreaker (+1) not a large boost.
+    subset = df[[x, y] + list(Z)].dropna()
+    if len(subset) < 30 + len(Z):
+        return 0.0, 1.0
+
+    try:
+        Zmat = subset[list(Z)].values
+        x_resid = subset[x].values - LinearRegression().fit(Zmat, subset[x].values).predict(Zmat)
+        y_resid = subset[y].values - LinearRegression().fit(Zmat, subset[y].values).predict(Zmat)
+        if np.std(x_resid) < 1e-9 or np.std(y_resid) < 1e-9:
+            return 0.0, 1.0
+        r, p = stats.pearsonr(x_resid, y_resid)
+        return r, p
+    except Exception:
+        return 0.0, 1.0
+
+
+def grow_shrink_markov_blanket(df, target_col, candidates, alpha_mb=0.01,
+                                max_mb_size=40):
+    """Discover Markov Blanket using Grow-Shrink algorithm.
+
+    The MB(Y) = Parents(Y) ∪ Children(Y) ∪ Co-Parents(Y).
+
+    Grow phase: Add variables that are NOT conditionally independent of Y
+    given the current blanket (partial correlation test).
+
+    Shrink phase: Remove variables that become conditionally independent
+    of Y given the rest of the blanket.
+
+    Reference: Margaritis & Thrun (2000). Bayesian Network Induction via
+    Local Neighborhoods.
+    """
+    print(f"\n  === MARKOV BLANKET DISCOVERY (Grow-Shrink) ===")
+    print(f"    Target: {target_col}  |  Candidates: {len(candidates)}  |  alpha={alpha_mb}")
+
+    # Subsample for speed (partial corr is O(n) per test)
+    n = len(df)
+    if n > 30000:
+        idx = np.random.RandomState(42).choice(n, 30000, replace=False)
+        df_sub = df.iloc[idx].copy()
+    else:
+        df_sub = df.copy()
+
+    mb = []
+    # GROW: add variables that are dependent on target given current MB
+    for c in candidates:
+        if c == target_col or c not in df_sub.columns:
+            continue
+        if df_sub[c].std() < 1e-9:
+            continue
+        r, p = _partial_corr(c, target_col, mb, df_sub)
+        if p < alpha_mb and abs(r) > 0.01:
+            mb.append(c)
+            if len(mb) >= max_mb_size:
+                break
+
+    print(f"    After GROW: {len(mb)} variables")
+
+    # SHRINK: remove variables that are conditionally independent given rest
+    to_remove = []
+    for c in mb:
+        rest = [v for v in mb if v != c]
+        r, p = _partial_corr(c, target_col, rest, df_sub)
+        if p >= alpha_mb or abs(r) < 0.005:
+            to_remove.append(c)
+
+    for c in to_remove:
+        mb.remove(c)
+
+    print(f"    After SHRINK: {len(mb)} variables")
+    print(f"    MB: {mb[:20]}{'...' if len(mb) > 20 else ''}")
+
+    return mb
+
+
+def build_candidate_pool(df, target_col, mb_vars=None):
+    """Build candidate pool using MB + correlation + MI.
+
+    v7: MB variables get priority (+15 score boost), ensuring they're
+    always included in the candidate pool. Then correlation and MI
+    fill remaining slots.
     """
     K    = CANDIDATES_PER_PASS
     pool = _pool(df)
@@ -152,7 +259,7 @@ def build_candidate_pool(df, target_col):
         except: continue
     corr_top = sorted(corrs.items(), key=lambda kv: -kv[1])[:K]
 
-    # Pass 2: continuous mutual info (not classification)
+    # Pass 2: continuous mutual info
     idx  = np.random.RandomState(42).choice(len(df), min(20000, len(df)), replace=False)
     X_s  = df.iloc[idx][pool].fillna(df.iloc[idx][pool].median()).values
     y_s  = y.values[idx]
@@ -163,15 +270,23 @@ def build_candidate_pool(df, target_col):
         print(f"    MI failed: {e}")
         mi_top = []
 
-    # Score accumulation (no DOMAIN_BONUS — domain features get +1 tiebreaker)
+    # Score accumulation
     scores = {}
     for rank, (c, _) in enumerate(corr_top):
         scores[c] = scores.get(c, 0) + (K - rank)
     for rank, (c, _) in enumerate(mi_top):
         scores[c] = scores.get(c, 0) + (K - rank)
+
+    # v7: MB variables get priority boost
+    mb_set = set(mb_vars or [])
+    for c in mb_set:
+        if c in df.columns and c not in EXCLUDE:
+            scores[c] = scores.get(c, 0) + 15  # strong boost
+
+    # Domain features get tiebreaker
     for c in DOMAIN_FEATURES:
         if c in df.columns and c not in EXCLUDE:
-            scores[c] = scores.get(c, 0) + 1  # tiebreaker only
+            scores[c] = scores.get(c, 0) + 1
 
     valid = [c for c in scores
              if c in df.columns and df[c].fillna(df[c].median()).std() > 1e-9]
@@ -275,15 +390,15 @@ def run_icp_exhaustive(df, env_labels, target_col, candidates, alpha=None):
     }
 
 
-def run_for_stratum(df, target_col, stratum_label):
+def run_for_stratum(df, target_col, stratum_label, mb_vars=None):
     """Run ICP for a single stratum with multi-alpha sensitivity analysis."""
     print(f"\n  ===== {stratum_label} | target={target_col} =====")
     env = build_environments(df)
     df_f, env_f = filter_environments(df, env)
     if len(df_f) < 500 or env_f.nunique() < 2:
-        print("    Skipped")
+        print("    Skipped (insufficient data or environments)")
         return None
-    cands = build_candidate_pool(df_f, target_col)
+    cands = build_candidate_pool(df_f, target_col, mb_vars=mb_vars)
     if len(cands) < 2: return None
 
     # Primary run
@@ -316,10 +431,9 @@ def run_for_stratum(df, target_col, stratum_label):
 
 def main():
     print("="*70)
-    print("STEP 09a -- ICP v6 (IMPROVED: KS test + soft intersection + multi-alpha)")
+    print("STEP 09a -- ICP v7 (Markov Blanket + Rich Environments)")
     print(f"  alpha_sweep={ALPHA_SWEEP}  candidates={MAX_CANDIDATES_FINAL}"
           f"  soft_pct={SOFT_INTERSECTION_PCT}")
-    print(f"  subsets=15275/run  targets=3  strata=3")
     print("="*70)
 
     df = pd.read_csv(INPUT_CSV, low_memory=False)
@@ -332,6 +446,21 @@ def main():
 
     TARGETS = ['action_ordinal', 'is_buy', 'is_sell']
 
+    # v7: Compute Markov Blanket FIRST for each target
+    pool = _pool(df)
+    print(f"\n  Feature pool: {len(pool)} numeric columns")
+
+    mb_results = {}
+    for target in TARGETS:
+        mb = grow_shrink_markov_blanket(df, target, pool)
+        mb_results[target] = mb
+
+    # Save MB results
+    os.makedirs(CAUSAL_DIR, exist_ok=True)
+    with open(OUTPUT_MB, 'w') as f:
+        json.dump(mb_results, f, indent=2)
+    print(f"\n  Saved MB: {OUTPUT_MB}")
+
     all_results = {}
 
     for target in TARGETS:
@@ -339,16 +468,21 @@ def main():
         print(f"TARGET: {target}")
         print(f"{'='*60}")
 
-        all_results[f'pooled_{target}'] = run_for_stratum(df, target, 'pooled')
+        mb_vars = mb_results[target]
 
+        # Pooled (all data)
+        all_results[f'pooled_{target}'] = run_for_stratum(
+            df, target, 'pooled', mb_vars=mb_vars)
+
+        # Strata by Fund_Type
         if 'Fund_Type' in df.columns:
-            small = df[df['Fund_Type'].astype(str).str.strip().str.lower() == 'small cap']
-            if len(small) > 500:
-                all_results[f'small_cap_{target}'] = run_for_stratum(small, target, 'small_cap')
-
-            mid = df[df['Fund_Type'].astype(str).str.strip().str.lower() == 'mid cap']
-            if len(mid) > 500:
-                all_results[f'mid_cap_{target}'] = run_for_stratum(mid, target, 'mid_cap')
+            for ft_name, ft_filter in [('small_cap', 'small cap'),
+                                        ('mid_cap', 'mid cap'),
+                                        ('large_cap', 'large cap')]:
+                sub = df[df['Fund_Type'].astype(str).str.strip().str.lower() == ft_filter]
+                if len(sub) > 500:
+                    all_results[f'{ft_name}_{target}'] = run_for_stratum(
+                        sub, target, ft_name, mb_vars=mb_vars)
 
     # Aggregate
     rows = []

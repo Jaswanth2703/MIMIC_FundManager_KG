@@ -167,15 +167,25 @@ def main():
                'allocation_quintile', 'holding_tenure'}
 
     # 4. Load M1/M2 feature lists
-    # M1: Granger Markov Blanket features
+    # M1: Markov Blanket features (v7: from step09a Grow-Shrink)
+    mb_path = os.path.join(os.path.dirname(__file__), 'data', 'causal', 'markov_blanket.json')
     granger_path = os.path.join(os.path.dirname(__file__), 'data', 'causal', 'granger_causal_links.csv')
-    if os.path.exists(granger_path):
+    if os.path.exists(mb_path):
+        import json
+        with open(mb_path) as f:
+            mb_data = json.load(f)
+        mb_feats = set()
+        for target_mb in mb_data.values():
+            mb_feats.update(target_mb)
+        granger_feats = sorted([f for f in mb_feats if f in df.columns and f not in exclude])
+        print(f"  M1 Markov Blanket: {len(granger_feats)} features")
+    elif os.path.exists(granger_path):
         granger_df_feats = pd.read_csv(granger_path)
         granger_feats = sorted(granger_df_feats['cause'].unique().tolist())
         granger_feats = [f for f in granger_feats if f in df.columns and f not in exclude]
     else:
         granger_feats = []
-        print("  WARNING: granger_causal_links.csv not found, M1 will be empty")
+        print("  WARNING: No MB or granger file found, M1 will be empty")
 
     # M2: Correlation top-K features
     if 'position_action' in df.columns:

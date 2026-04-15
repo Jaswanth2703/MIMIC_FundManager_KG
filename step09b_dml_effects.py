@@ -1,23 +1,21 @@
 """
-Step 09b -- Double Machine Learning (DML) for Causal Effect Sizes v4
+Step 09b -- Double Machine Learning (DML) for Causal Effect Sizes v5
 =====================================================================
-Runs DML on a comprehensive fixed feature list across all 3 targets.
-ICP certification is used as a quality flag on results, not as a gate.
+Runs DML on auto-discovered features + comprehensive fixed list.
 
-v4 improvements:
-- Control selection by confounding score (corr with both T and Y),
-  not by variance (which is causally meaningless)
-- Repeated cross-fitting (3 repetitions) for more stable estimates
-- Updated sentiment features (sentiment_confidence, sentiment_extremity
-  replace removed sentiment_trend)
-- BUGFIX: Guard against empty controls list in double_ml + fallback
-  in get_controls so X never has 0 columns (was crashing on treatment 2+)
+v5 improvements:
+- Auto-discovers all numeric columns in LPCMCI_READY.csv (no hardcoded only)
+- Adds interaction features (pe_x_momentum, rsi_x_momentum, etc.)
+- Adds non-linear transforms (log_market_cap, sqrt_volatility, etc.)
+- Loads Markov Blanket from step09a to prioritize MB variables
+- Falls back to comprehensive fixed list for columns not in data
 
 Reference:
   Chernozhukov et al. (2018). Double/debiased machine learning.
   Econometrics Journal, 21(1), C1-C68.
 
 Input:  data/causal_output/icp_causal_parents.csv  (for ICP flag)
+        data/causal_output/markov_blanket.json     (for MB priority)
         data/features/LPCMCI_READY.csv
 Output: data/causal_output/dml_causal_effects.csv
 """
@@ -35,6 +33,7 @@ from config import FEATURES_DIR, CAUSAL_DIR
 
 INPUT_FEAT    = os.path.join(FEATURES_DIR, 'LPCMCI_READY.csv')
 INPUT_PARENTS = os.path.join(CAUSAL_DIR, 'icp_causal_parents.csv')
+INPUT_MB      = os.path.join(CAUSAL_DIR, 'markov_blanket.json')
 OUTPUT_CSV    = os.path.join(CAUSAL_DIR, 'dml_causal_effects.csv')
 
 ACTION_MAP = {
@@ -55,11 +54,11 @@ LEAK = {
 }
 
 # ============================================================
-# Comprehensive treatment list — run DML on ALL of these
-# regardless of ICP nomination.
-# ICP certification is added as a flag on the output.
 # ============================================================
-ALL_TREATMENTS = [
+# Treatment list: comprehensive + auto-discovered
+# ============================================================
+# v5: Core treatments (always tested if present in data)
+CORE_TREATMENTS = [
     # Position management (lagged — no lookahead)
     'allocation_change_lag1',
     'allocation_change_lag2',
@@ -118,7 +117,56 @@ ALL_TREATMENTS = [
     'sentiment_extremity',
     'positive_ratio',
     'negative_ratio',
+    # v5: Interaction features
+    'pe_x_momentum',
+    'rsi_x_momentum',
+    'vix_x_return',
+    'sentiment_x_momentum',
+    'alloc_x_sentiment',
+    # v5: Non-linear transforms
+    'log_market_cap',
+    'log_pe',
+    'sqrt_volatility',
+    'log_volume_ratio',
 ]
+
+
+def build_treatment_list(df):
+    """Build treatment list from CORE + auto-discovered columns + MB.
+
+    v5: Auto-discovers all numeric columns that could be treatments.
+    Ensures no feature is missed because of name changes from pruning.
+    """
+    # Start with core treatments that exist in data
+    treatments = [t for t in CORE_TREATMENTS if t in df.columns]
+    existing = set(treatments)
+
+    # Auto-discover: any numeric column not in LEAK/EXCLUDE
+    auto_exclude = LEAK | {
+        'year_month_str', 'ISIN', 'Fund_Name', 'Fund_Type',
+        'sector', 'stock_name', 'stock_name_raw', 'Industry',
+        'date', 'Date', 'holding_period_id', 'fund_ticker',
+        'symbol', 'golden_cross', 'death_cross', 'size',
+        'year_month', 'month_ordinal',
+    }
+    for c in df.select_dtypes(include=[np.number]).columns:
+        if c not in existing and c not in auto_exclude:
+            if df[c].std() > 1e-9 and c not in existing:
+                treatments.append(c)
+                existing.add(c)
+
+    # Load MB variables (from step09a) and ensure they're included
+    if os.path.exists(INPUT_MB):
+        import json
+        with open(INPUT_MB) as f:
+            mb = json.load(f)
+        for target_mb in mb.values():
+            for v in target_mb:
+                if v in df.columns and v not in existing and v not in auto_exclude:
+                    treatments.append(v)
+                    existing.add(v)
+
+    return treatments
 
 # Three targets — matching ICP v5
 TARGETS = {
@@ -236,9 +284,7 @@ def get_controls(df, treatment, outcome):
 
 def main():
     print("=" * 70)
-    print("STEP 09b -- DML v4  |  confounder-scored controls  |  repeated cross-fitting")
-    print(f"  Treatments: {len(ALL_TREATMENTS)}  |  Targets: {len(TARGETS)}")
-    print(f"  Est. runtime: ~60-90 minutes")
+    print("STEP 09b -- DML v5  |  auto-discovery + MB + interactions")
     print("=" * 70)
 
     df = pd.read_csv(INPUT_FEAT, low_memory=False)
@@ -248,6 +294,11 @@ def main():
     df = df.dropna(subset=['action_ordinal']).copy()
     df['is_buy']  = (df['action_ordinal'] == 2).astype(float)
     df['is_sell'] = (df['action_ordinal'] == 0).astype(float)
+
+    # v5: Auto-discover treatments
+    ALL_TREATMENTS = build_treatment_list(df)
+    print(f"  Treatments: {len(ALL_TREATMENTS)}  |  Targets: {len(TARGETS)}")
+    print(f"  Est. runtime: ~{len(ALL_TREATMENTS) * len(TARGETS) * 2 // 60} minutes")
 
     # Load ICP results to flag certified variables
     icp_certified = set()

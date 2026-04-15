@@ -253,12 +253,23 @@ def main():
     all_feats = [c for c in df.select_dtypes(include=[np.number]).columns
                  if c not in EXCLUDE]
 
-    # Granger MB features
+    # M1: Markov Blanket features (from step09a Grow-Shrink)
+    mb_file = os.path.join(CAUSAL_DIR, 'markov_blanket.json')
     granger_file = os.path.join(CAUSAL_DIR, 'all_causal_links.csv')
-    if os.path.exists(granger_file):
+    if os.path.exists(mb_file):
+        with open(mb_file) as f:
+            mb_data = json.load(f)
+        # Union of MB across all targets
+        mb_feats = set()
+        for target_mb in mb_data.values():
+            mb_feats.update(target_mb)
+        granger_feats = sorted([f for f in mb_feats if f in df.columns and f not in EXCLUDE])
+        print(f"\n  M1 Markov Blanket: {len(granger_feats)} features")
+    elif os.path.exists(granger_file):
         granger_df = pd.read_csv(granger_file)
         granger_feats = sorted(granger_df['cause'].unique().tolist())
         granger_feats = [f for f in granger_feats if f in df.columns and f not in EXCLUDE]
+        print(f"\n  M1 Granger features (fallback): {len(granger_feats)}")
     else:
         granger_feats = all_feats[:20]
 
@@ -271,10 +282,10 @@ def main():
     else:
         corr_feats = all_feats[:20]
 
-    # ICP causal parents
+    # M3: ICP causal parents (v7: lowered threshold since ICP now finds more)
     if os.path.exists(INPUT_ICP):
         icp = pd.read_csv(INPUT_ICP)
-        icp_feats = sorted(icp[icp['confidence'] >= 0.5]['variable'].unique())
+        icp_feats = sorted(icp[icp['confidence'] >= 0.3]['variable'].unique())
         lagged = []
         for f in icp_feats:
             for lag in [1, 2]:
@@ -282,7 +293,8 @@ def main():
                 if col in df.columns:
                     lagged.append(col)
         icp_feats_full = list(dict.fromkeys(icp_feats + lagged))
-        print(f"\n  M3 ICP features: {len(icp_feats_full)} (from {len(icp_feats)} parents + lags)")
+        icp_feats_full = [f for f in icp_feats_full if f in df.columns and f not in EXCLUDE]
+        print(f"  M3 ICP features: {len(icp_feats_full)} (from {len(icp_feats)} parents + lags)")
     else:
         icp_feats_full = None
         print("  ICP file not found -- M3 skipped")

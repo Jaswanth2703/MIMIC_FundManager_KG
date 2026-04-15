@@ -306,11 +306,23 @@ def causal_method_ablation(df, feature_groups):
         icp_medium = set(icp_df[icp_df['confidence'] >= 0.10]['variable'].unique()) \
             & set(df.columns)
 
+    # v7: Load Markov Blanket features
+    mb_feats = set()
+    mb_path = os.path.join(os.path.dirname(__file__), 'data', 'causal', 'markov_blanket.json')
+    if os.path.exists(mb_path):
+        import json as _json
+        with open(mb_path) as f:
+            mb_data = _json.load(f)
+        for target_mb in mb_data.values():
+            mb_feats.update(target_mb)
+        mb_feats = mb_feats & set(df.columns)
+
     print(f"    Granger features: {len(granger_feats)}")
     print(f"    ICP features (>=0.25): {len(icp_feats)}")
     print(f"    ICP features (>=0.50): {len(icp_high)}")
     print(f"    ICP features (>=0.10): {len(icp_medium)}")
     print(f"    DML features: {len(dml_feats)}")
+    print(f"    Markov Blanket features: {len(mb_feats)}")
 
     all_numeric = [c for c in df.select_dtypes(include=[np.number]).columns
                    if c not in ['action_ordinal']
@@ -325,14 +337,16 @@ def causal_method_ablation(df, feature_groups):
     # Test each method's feature selection
     methods = {
         'all_features': set(all_numeric),
+        'markov_blanket': mb_feats,
         'granger_only': granger_feats,
         'icp_only_conf25': icp_feats,
         'icp_only_conf50': icp_high,
         'icp_only_conf10': icp_medium,
         'dml_only': dml_feats,
-        'granger_intersection_icp': granger_feats & icp_feats,
+        'mb_union_dml': mb_feats | dml_feats,
+        'mb_union_icp': mb_feats | icp_feats,
         'granger_union_icp': granger_feats | icp_feats,
-        'all_causal_union': granger_feats | icp_feats | dml_feats,
+        'all_causal_union': granger_feats | icp_feats | dml_feats | mb_feats,
         'all_causal_intersection': granger_feats & icp_feats & dml_feats,
         'dml_intersection_icp': dml_feats & icp_feats,
         'granger_intersection_dml': granger_feats & dml_feats,
@@ -381,6 +395,7 @@ def model_ablation(df, features):
         'RandomForest': (RandomForestClassifier,
                          {'n_estimators': 200, 'max_depth': 10,
                           'random_state': 42, 'n_jobs': -1}),
+    }
     # Use XGBoost instead of sklearn GBM (much faster with GPU)
     if XGBOOST_OK:
         models['XGBoost_GPU'] = (XGBClassifier,
