@@ -72,9 +72,11 @@ INPUT_DML = os.path.join(CAUSAL_DIR, 'dml_causal_effects.csv')
 OUT_PATHS = os.path.join(FINAL_DIR, 'decision_paths.json')
 OUT_METRICS = os.path.join(FINAL_DIR, 'path_model_results.json')
 OUT_EMBEDDINGS = os.path.join(FINAL_DIR, 'path_embeddings.npy')
+OUT_DECISIONS = os.path.join(FINAL_DIR, 'path_decision_predictions.csv')
 
 ACTION_MAP = {'BUY': 2, 'INCREASE': 2, 'INITIAL_POSITION': 2,
               'HOLD': 1, 'DECREASE': 0, 'SELL': 0}
+ACTION_LABELS = {2: 'BUY', 1: 'HOLD', 0: 'SELL'}
 
 # Maximum path hops
 MAX_PATH_HOPS = 5
@@ -605,6 +607,7 @@ def train_path_model(paths, train_months_list, test_months_list):
     model.eval()
     with torch.no_grad():
         logits = model(test_data[0], test_data[1], test_data[2], test_data[3])
+        proba = torch.softmax(logits, dim=1).cpu().numpy()
         preds = logits.argmax(dim=1).cpu().numpy()
         true = test_data[4].cpu().numpy()
 
@@ -615,6 +618,25 @@ def train_path_model(paths, train_months_list, test_months_list):
                                    target_names=['SELL', 'HOLD', 'BUY'],
                                    output_dict=True)
     print(f"\n  Path Model Results: Acc={acc:.4f}, F1={f1:.4f}")
+
+    # Build per-decision predictions for downstream (step14b, step16)
+    test_path_indices = np.where(test_mask)[0]
+    decision_records = []
+    for i, pi in enumerate(test_path_indices):
+        p = paths[pi]
+        decision_records.append({
+            'Fund_Name': p.get('fund', ''),
+            'ISIN': p.get('isin', ''),
+            'year_month_str': p.get('month', ''),
+            'path_predicted': int(preds[i]),
+            'path_predicted_label': ACTION_LABELS.get(int(preds[i]), str(preds[i])),
+            'path_confidence': float(proba[i].max()),
+            'path_proba_sell': float(proba[i][0]),
+            'path_proba_hold': float(proba[i][1]),
+            'path_proba_buy': float(proba[i][2]),
+            'actual': int(true[i]),
+            'actual_label': ACTION_LABELS.get(int(true[i]), ''),
+        })
 
     # Extract path embeddings for clustering (fund manager style analysis)
     with torch.no_grad():
@@ -640,7 +662,7 @@ def train_path_model(paths, train_months_list, test_months_list):
         'n_paths': len(paths),
         'model_type': 'PathTransformer',
         'device': str(device),
-    }, embeddings
+    }, embeddings, decision_records
 
 
 def _sklearn_fallback(paths, train_months, test_months):
@@ -681,6 +703,23 @@ def _sklearn_fallback(paths, train_months, test_months):
                                    output_dict=True)
     print(f"\n  Path Model (GBM fallback): Acc={acc:.4f}, F1={f1:.4f}")
 
+    # Build per-decision predictions
+    test_indices = np.where(test_mask)[0]
+    decision_records = []
+    for i, pi in enumerate(test_indices):
+        p = paths[pi]
+        decision_records.append({
+            'Fund_Name': p.get('fund', ''),
+            'ISIN': p.get('isin', ''),
+            'year_month_str': p.get('month', ''),
+            'path_predicted': int(preds[i]),
+            'path_predicted_label': ACTION_LABELS.get(int(preds[i]), str(preds[i])),
+            'path_confidence': 0.0,
+            'path_proba_sell': 0.0, 'path_proba_hold': 0.0, 'path_proba_buy': 0.0,
+            'actual': int(true[i]),
+            'actual_label': ACTION_LABELS.get(int(true[i]), ''),
+        })
+
     return {
         'accuracy': float(acc),
         'f1_weighted': float(f1),
@@ -689,7 +728,7 @@ def _sklearn_fallback(paths, train_months, test_months):
         'n_test': int(test_mask.sum()),
         'n_paths': len(paths),
         'model_type': 'GBM_path_fallback',
-    }, X  # Use encoded vectors as embeddings
+    }, X, decision_records  # Use encoded vectors as embeddings
 
 
 # ============================================================
@@ -745,7 +784,7 @@ def main():
     print(f"  Train months: {train_months[0]}..{train_months[-1]} ({len(train_months)})")
     print(f"  Test months:  {test_months[0]}..{test_months[-1]} ({len(test_months)})")
 
-    results, embeddings = train_path_model(paths, train_months, test_months)
+    results, embeddings, decision_records = train_path_model(paths, train_months, test_months)
 
     # Save results
     with open(OUT_METRICS, 'w') as f:
@@ -754,6 +793,12 @@ def main():
 
     np.save(OUT_EMBEDDINGS, embeddings)
     print(f"  Saved embeddings: {OUT_EMBEDDINGS} ({embeddings.shape})")
+
+    # Save per-decision predictions for downstream (step14b, step16)
+    if decision_records:
+        dec_df = pd.DataFrame(decision_records)
+        dec_df.to_csv(OUT_DECISIONS, index=False)
+        print(f"  Saved decisions: {OUT_DECISIONS} ({len(dec_df)} predictions)")
 
     # 4. Summary
     print(f"\n{'='*70}")

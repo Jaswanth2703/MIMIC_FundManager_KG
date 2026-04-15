@@ -597,6 +597,39 @@ def main():
                                      target_names=['SELL', 'HOLD', 'BUY'],
                                      zero_division=0))
 
+        # Save per-decision predictions for downstream (step14b, step16)
+        action_labels = {2: 'BUY', 1: 'HOLD', 0: 'SELL'}
+        test_indices = test_mask.nonzero(as_tuple=True)[0].cpu().numpy()
+        decision_records = []
+        fund_names = holds.get('fund_names', [])
+        stock_isins = holds.get('stock_isins', [])
+        month_strs = holds.get('month_strs', [])
+        if fund_names and stock_isins and month_strs:
+            for i, ti in enumerate(test_indices):
+                decision_records.append({
+                    'Fund_Name': fund_names[ti] if ti < len(fund_names) else '',
+                    'ISIN': stock_isins[ti] if ti < len(stock_isins) else '',
+                    'year_month_str': month_strs[ti] if ti < len(month_strs) else '',
+                    f'{model_name.lower().replace("-","_")}_predicted': int(te_preds[i]),
+                    f'{model_name.lower().replace("-","_")}_label': action_labels.get(int(te_preds[i]), ''),
+                    'actual': int(te_labels[i]),
+                    'actual_label': action_labels.get(int(te_labels[i]), ''),
+                })
+            pred_file = os.path.join(DATA_DIR,
+                                     f'{model_name.lower().replace("-","_")}_decision_predictions.csv')
+            import pandas as pd
+            pd.DataFrame(decision_records).to_csv(pred_file, index=False)
+            print(f"  Saved: {pred_file} ({len(decision_records)} decisions)")
+            # Also copy to final/
+            final_dir = os.path.join(SCRIPT_DIR, 'data', 'final')
+            if os.path.exists(final_dir):
+                import shutil
+                shutil.copy(pred_file, os.path.join(
+                    final_dir, f'{model_name.lower().replace("-","_")}_decision_predictions.csv'))
+        else:
+            print(f"  NOTE: No fund/stock/month identifiers in export. "
+                  f"Re-run step13b_export_kg_for_gpu.py to enable prediction mapping.")
+
         all_results[model_name] = {
             'method': f'{model_name} on Fund Manager KG',
             'model': model_name,
@@ -647,6 +680,22 @@ def main():
     with open(OUTPUT_JSON, 'w') as f:
         json.dump(all_results, f, indent=2)
     print(f"\n  Saved: {OUTPUT_JSON}")
+
+    # Save node embeddings for downstream use (step16c style clustering, etc.)
+    try:
+        last_model_name = models_to_run[-1][0] if models_to_run else None
+        if last_model_name:
+            model.eval()
+            with torch.no_grad():
+                embeddings = {}
+                for ntype in data.node_types:
+                    if hasattr(data[ntype], 'x'):
+                        embeddings[ntype] = data[ntype].x.cpu().numpy()
+            emb_path = os.path.join(DATA_DIR, 'hgt_embeddings.npz')
+            np.savez(emb_path, **embeddings)
+            print(f"  Saved node embeddings: {emb_path}")
+    except Exception as e:
+        print(f"  Warning: could not save embeddings: {e}")
 
     # Copy to final/
     final_dir = os.path.join(SCRIPT_DIR, 'data', 'final')

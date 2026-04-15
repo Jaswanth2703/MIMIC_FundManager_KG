@@ -76,6 +76,7 @@ INPUT_CAUSAL = os.path.join(CAUSAL_DIR, 'all_causal_links.csv')
 OUT_PRED = os.path.join(FINAL_DIR, 'cbr_predictions.csv')
 OUT_CASES = os.path.join(FINAL_DIR, 'cbr_retrieved_cases.json')
 OUT_METRICS = os.path.join(FINAL_DIR, 'cbr_metrics.json')
+OUT_DECISIONS = os.path.join(FINAL_DIR, 'cbr_decision_predictions.csv')
 
 ACTION_MAP = {'BUY': 2, 'INCREASE': 2, 'INITIAL_POSITION': 2,
               'HOLD': 1, 'DECREASE': 0, 'SELL': 0}
@@ -596,6 +597,7 @@ def walk_forward_cbr(df, hybrid_vecs, k=K_NEIGHBOURS, sample_max=30):
     all_true, all_pred = [], []
     fold_metrics = []
     sample_cases = []
+    decision_records = []  # per-decision predictions for downstream
 
     for fold_idx, test_m in enumerate(test_months):
         t_idx = month_to_idx[test_m]
@@ -613,8 +615,27 @@ def walk_forward_cbr(df, hybrid_vecs, k=K_NEIGHBOURS, sample_max=30):
                 qi, train_idxs, hybrid_vecs, actions, month_indices, t_idx, k)
             preds.append(pred)
 
+            # Compute confidence as top-vote weight fraction
+            vote_weights = {}
+            for nb in retrieved:
+                a = nb['action']
+                vote_weights[a] = vote_weights.get(a, 0) + nb['final_weight']
+            total_w = sum(vote_weights.values()) or 1.0
+            confidence = vote_weights.get(pred, 0) / total_w
+
+            row = df.iloc[qi]
+            decision_records.append({
+                'Fund_Name': str(row.get('Fund_Name', '')),
+                'ISIN': str(row.get('ISIN', '')),
+                'year_month_str': test_m,
+                'cbr_predicted': int(pred),
+                'cbr_predicted_label': ACTION_LABELS.get(pred, str(pred)),
+                'cbr_confidence': float(confidence),
+                'actual': int(actions[qi]),
+                'actual_label': ACTION_LABELS.get(int(actions[qi]), ''),
+            })
+
             if len(sample_cases) < sample_max and len(preds) % 100 == 1:
-                row = df.iloc[qi]
                 sample_cases.append({
                     'fund': str(row.get('Fund_Name', '')),
                     'stock': str(row.get('stock_name', row.get('ISIN', ''))),
@@ -646,7 +667,7 @@ def walk_forward_cbr(df, hybrid_vecs, k=K_NEIGHBOURS, sample_max=30):
             print(f"    Fold {fold_idx+1:3d}  test={test_m}  "
                   f"n={len(test_idxs):4d}  acc={acc:.3f}  f1={f1:.3f}")
 
-    return all_true, all_pred, fold_metrics, sample_cases
+    return all_true, all_pred, fold_metrics, sample_cases, decision_records
 
 
 # ============================================================
@@ -702,7 +723,7 @@ def main():
 
     # 4. Walk-forward CBR
     print("\n  Running walk-forward CBR evaluation ...")
-    y_true, y_pred, fold_metrics, sample_cases = walk_forward_cbr(
+    y_true, y_pred, fold_metrics, sample_cases, decision_records = walk_forward_cbr(
         df, hybrid_vecs, k=K_NEIGHBOURS)
 
     if not fold_metrics:
@@ -759,6 +780,14 @@ def main():
     print(f"\n  Saved: {OUT_PRED}")
     print(f"  Saved: {OUT_CASES}")
     print(f"  Saved: {OUT_METRICS}")
+
+    # Save per-decision predictions for downstream (step14b, step16)
+    if decision_records:
+        dec_df = pd.DataFrame(decision_records)
+        dec_df.to_csv(OUT_DECISIONS, index=False)
+        print(f"  Saved: {OUT_DECISIONS} ({len(dec_df)} decisions)")
+    else:
+        print(f"  WARNING: No decision records to save")
 
     print(f"\n  WHY THIS REQUIRES THE KG:")
     print(f"  - WL kernel hashes multi-hop graph neighborhoods")

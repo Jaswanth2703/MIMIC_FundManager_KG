@@ -260,6 +260,8 @@ def process_holds(holds_data, maps, df):
     """Convert HOLDS query results to edge index + features + labels."""
     fund_idx, stock_idx, month_idx, labels = [], [], [], []
     feat_rows = []
+    # Track identifiers for downstream prediction mapping
+    fund_names_list, stock_isins_list, month_strs_list = [], [], []
 
     # Build month→months_sorted index
     all_months = sorted(maps['TimePeriod'].keys())
@@ -306,6 +308,9 @@ def process_holds(holds_data, maps, df):
         month_idx.append(mi)
         labels.append(action)
         feat_rows.append(feat)
+        fund_names_list.append(str(r.get('fund', '')))
+        stock_isins_list.append(str(r.get('isin', '')))
+        month_strs_list.append(month)
 
     n_feats = len([c for c in HOLDS_FEATURES if c in df.columns]) if df is not None else 8
     feat_arr = np.array(feat_rows, dtype=np.float32)
@@ -318,6 +323,9 @@ def process_holds(holds_data, maps, df):
         'edge_attr':  feat_arr,
         'labels':     np.array(labels, dtype=np.int64),
         'month_idx':  np.array(month_idx, dtype=np.int64),
+        'fund_names': fund_names_list,
+        'stock_isins': stock_isins_list,
+        'month_strs': month_strs_list,
     }
 
 

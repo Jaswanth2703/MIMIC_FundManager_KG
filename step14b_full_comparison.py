@@ -52,6 +52,11 @@ INPUT_ICP = os.path.join(CAUSAL_DIR, 'icp_causal_parents.csv')
 INPUT_DML = os.path.join(CAUSAL_DIR, 'dml_causal_effects.csv')
 EXISTING_COMPARISON = os.path.join(FINAL_DIR, 'portfolio_comparison.json')
 CBR_METRICS = os.path.join(FINAL_DIR, 'cbr_metrics.json')
+CBR_DECISIONS = os.path.join(FINAL_DIR, 'cbr_decision_predictions.csv')
+PATH_DECISIONS = os.path.join(FINAL_DIR, 'path_decision_predictions.csv')
+HGT_DECISIONS = os.path.join(FINAL_DIR, 'hgt_decision_predictions.csv')
+CIHGT_DECISIONS = os.path.join(FINAL_DIR, 'ci_hgt_decision_predictions.csv')
+HGT_METRICS = os.path.join(FINAL_DIR, 'hgt_results.json')
 OUT_JSON = os.path.join(FINAL_DIR, 'full_comparison.json')
 OUT_CSV = os.path.join(FINAL_DIR, 'full_comparison.csv')
 
@@ -328,23 +333,120 @@ def main():
                       f"  Agreement: {result.get('decision_agreement', 0):.3f}")
 
     # --- Add M4 CBR from step13 ---
-    if os.path.exists(CBR_METRICS):
-        with open(CBR_METRICS) as f:
-            cbr = json.load(f)
+    # Prefer per-decision predictions; fallback to aggregate metrics
+    if os.path.exists(CBR_DECISIONS):
+        cbr_dec = pd.read_csv(CBR_DECISIONS)
+        cbr_mimicry = compute_mimicry_metrics(
+            cbr_dec['actual'].tolist(), cbr_dec['cbr_predicted'].tolist())
         for mode in ['walk_forward', 'temporal_holdout']:
             all_results[f'M4_CBR_KG__{mode}'] = {
                 'model': 'M4_CBR_KG',
                 'eval_mode': mode,
                 'status': 'success',
+                'n_features': 0,
+                'accuracy': cbr_mimicry['accuracy'],
+                'f1_weighted': cbr_mimicry['f1_weighted'],
+                'cohens_kappa': cbr_mimicry['cohens_kappa'],
+                'decision_agreement': cbr_mimicry['decision_agreement'],
+                'buy_recall': cbr_mimicry.get('buy_recall', 0),
+                'sell_recall': cbr_mimicry.get('sell_recall', 0),
+                'n_decisions': len(cbr_dec),
+                'note': 'KG subgraph WL-kernel retrieval (step13)',
+            }
+        print(f"\n  M4 CBR (per-decision): acc={cbr_mimicry['accuracy']:.3f} "
+              f"kappa={cbr_mimicry['cohens_kappa']:.3f} ({len(cbr_dec)} decisions)")
+    elif os.path.exists(CBR_METRICS):
+        with open(CBR_METRICS) as f:
+            cbr = json.load(f)
+        for mode in ['walk_forward', 'temporal_holdout']:
+            all_results[f'M4_CBR_KG__{mode}'] = {
+                'model': 'M4_CBR_KG', 'eval_mode': mode, 'status': 'success',
                 'n_features': cbr.get('n_causal_features', 0),
                 'accuracy': cbr.get('overall_accuracy', cbr.get('avg_fold_accuracy')),
                 'f1_weighted': cbr.get('overall_f1_weighted', cbr.get('avg_fold_f1')),
                 'cohens_kappa': cbr.get('cohens_kappa', None),
                 'decision_agreement': cbr.get('decision_agreement', None),
-                'note': 'KG-based case retrieval (from step13)',
+                'note': 'KG-based CBR (aggregate metrics only)',
             }
+        print("\n  M4 CBR: loaded aggregate metrics (no per-decision predictions)")
     else:
-        print("\n  CBR metrics not found -- M4 skipped")
+        print("\n  CBR: no predictions or metrics found -- M4 skipped")
+
+    # --- Add M5 PathTransformer from per-decision predictions ---
+    if os.path.exists(PATH_DECISIONS):
+        path_dec = pd.read_csv(PATH_DECISIONS)
+        path_mimicry = compute_mimicry_metrics(
+            path_dec['actual'].tolist(), path_dec['path_predicted'].tolist())
+        for mode in ['walk_forward', 'temporal_holdout']:
+            all_results[f'M5_PathTransformer__{mode}'] = {
+                'model': 'M5_PathTransformer',
+                'eval_mode': mode,
+                'status': 'success',
+                'n_features': 0,
+                'accuracy': path_mimicry['accuracy'],
+                'f1_weighted': path_mimicry['f1_weighted'],
+                'cohens_kappa': path_mimicry['cohens_kappa'],
+                'decision_agreement': path_mimicry['decision_agreement'],
+                'buy_recall': path_mimicry.get('buy_recall', 0),
+                'sell_recall': path_mimicry.get('sell_recall', 0),
+                'n_decisions': len(path_dec),
+                'note': 'KG causal path Transformer (step13a)',
+            }
+        print(f"  M5 Path (per-decision): acc={path_mimicry['accuracy']:.3f} "
+              f"kappa={path_mimicry['cohens_kappa']:.3f} ({len(path_dec)} decisions)")
+    else:
+        print("  PathTransformer predictions not found -- M5 skipped")
+
+    # --- Add M6 HGT and M7 CI-HGT from per-decision predictions ---
+    for label, decisions_file, model_prefix in [
+            ('M6_HGT', HGT_DECISIONS, 'hgt'),
+            ('M7_CI_HGT', CIHGT_DECISIONS, 'ci_hgt')]:
+        if os.path.exists(decisions_file):
+            dec = pd.read_csv(decisions_file)
+            pred_col = f'{model_prefix}_predicted'
+            if pred_col in dec.columns:
+                mimicry = compute_mimicry_metrics(
+                    dec['actual'].tolist(), dec[pred_col].tolist())
+                for mode in ['walk_forward', 'temporal_holdout']:
+                    all_results[f'{label}__{mode}'] = {
+                        'model': label,
+                        'eval_mode': mode,
+                        'status': 'success',
+                        'n_features': 0,
+                        'accuracy': mimicry['accuracy'],
+                        'f1_weighted': mimicry['f1_weighted'],
+                        'cohens_kappa': mimicry['cohens_kappa'],
+                        'decision_agreement': mimicry['decision_agreement'],
+                        'buy_recall': mimicry.get('buy_recall', 0),
+                        'sell_recall': mimicry.get('sell_recall', 0),
+                        'n_decisions': len(dec),
+                        'note': f'KG GNN ({model_prefix.upper()}, step13b)',
+                    }
+                print(f"  {label} (per-decision): acc={mimicry['accuracy']:.3f} "
+                      f"kappa={mimicry['cohens_kappa']:.3f} ({len(dec)} decisions)")
+        else:
+            # Fallback: load aggregate metrics from HGT results JSON
+            if os.path.exists(HGT_METRICS):
+                with open(HGT_METRICS) as f:
+                    hgt_all = json.load(f)
+                key = 'HGT' if model_prefix == 'hgt' else 'CI-HGT'
+                if key in hgt_all:
+                    m = hgt_all[key]
+                    for mode in ['walk_forward', 'temporal_holdout']:
+                        all_results[f'{label}__{mode}'] = {
+                            'model': label,
+                            'eval_mode': mode,
+                            'status': 'success',
+                            'n_features': m.get('n_features', 0),
+                            'accuracy': m.get('overall_accuracy', 0),
+                            'f1_weighted': m.get('overall_f1_weighted', 0),
+                            'cohens_kappa': None,
+                            'decision_agreement': None,
+                            'note': f'KG GNN ({key}, step13b, aggregate metrics only)',
+                        }
+                    print(f"  {label} (aggregate): acc={m.get('overall_accuracy',0):.3f}")
+            else:
+                print(f"  {label} predictions not found -- skipped")
 
     # --- Print comparison table ---
     for mode in ['walk_forward', 'temporal_holdout']:

@@ -407,6 +407,43 @@ def model_ablation(df, features):
         except Exception as e:
             print(f"    {model_name}: ERROR - {e}")
 
+    # KG-based model predictions (from step13/13a/13b)
+    kg_pred_files = {
+        'CBR_KG': (os.path.join(FINAL_DIR, 'cbr_decision_predictions.csv'), 'cbr_predicted'),
+        'PathTransformer': (os.path.join(FINAL_DIR, 'path_decision_predictions.csv'), 'path_predicted'),
+        'HGT': (os.path.join(FINAL_DIR, 'hgt_decision_predictions.csv'), 'hgt_predicted'),
+        'CI_HGT': (os.path.join(FINAL_DIR, 'ci_hgt_decision_predictions.csv'), 'ci_hgt_predicted'),
+    }
+    for model_name, (pred_file, pred_col) in kg_pred_files.items():
+        if not os.path.exists(pred_file):
+            continue
+        try:
+            preds_df = pd.read_csv(pred_file)
+            if pred_col not in preds_df.columns or 'actual' not in preds_df.columns:
+                continue
+            preds = preds_df[pred_col].values
+            actuals = preds_df['actual'].values
+            valid_mask = ~np.isnan(preds) & ~np.isnan(actuals)
+            preds = preds[valid_mask].astype(int)
+            actuals = actuals[valid_mask].astype(int)
+            if len(preds) < 10:
+                continue
+            acc = float(np.mean(preds == actuals))
+            f1 = float(f1_score(actuals, preds, average='weighted', zero_division=0))
+            kappa = float(cohen_kappa_score(actuals, preds))
+            results[model_name] = {
+                'model': model_name,
+                'accuracy_mean': acc, 'accuracy_std': 0.0,
+                'f1_mean': f1, 'f1_std': 0.0,
+                'kappa_mean': kappa, 'kappa_std': 0.0,
+                'n_folds': 1,
+                'n_features': 0,
+                'note': 'KG-based model (pre-computed predictions)',
+            }
+            print(f"    {model_name:20s}: acc={acc:.4f} f1={f1:.4f} kappa={kappa:.4f} (KG)")
+        except Exception as e:
+            print(f"    {model_name}: ERROR - {e}")
+
     return results
 
 
