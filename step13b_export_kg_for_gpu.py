@@ -65,8 +65,9 @@ def build_node_maps(driver):
     sectors = query_neo4j(driver, "MATCH (n:Sector) RETURN n.name AS name ORDER BY n.name")
     maps['Sector'] = {r['name']: i for i, r in enumerate(sectors)}
 
-    months = query_neo4j(driver, "MATCH (n:TimePeriod) RETURN n.month AS month ORDER BY n.month")
-    maps['TimePeriod'] = {r['month']: i for i, r in enumerate(months) if r['month']}
+    months = query_neo4j(driver, "MATCH (n:TimePeriod) RETURN n.id AS month ORDER BY n.id")
+    valid_months = [r['month'] for r in months if r['month']]
+    maps['TimePeriod'] = {m: i for i, m in enumerate(valid_months)}
 
     cvars = query_neo4j(driver, "MATCH (n:CausalVariable) RETURN n.name AS name ORDER BY n.name")
     maps['CausalVariable'] = {r['name']: i for i, r in enumerate(cvars)}
@@ -121,11 +122,18 @@ def build_node_features(maps, df, icp_df, dml_df):
     feats['Sector'] = sector_feat
     print(f"  Sector features: {sector_feat.shape}")
 
-    # TimePeriod features: normalized month index
+    # TimePeriod features: normalized month index + month-of-year + year
     n_months = len(maps['TimePeriod'])
-    tp_feat = np.zeros((n_months, 1), dtype=np.float32)
-    for month, midx in maps['TimePeriod'].items():
+    n_tp_feats = 3  # normalized_idx, month_of_year_sin, month_of_year_cos
+    tp_feat = np.zeros((n_months, n_tp_feats), dtype=np.float32)
+    for month_str, midx in maps['TimePeriod'].items():
         tp_feat[midx, 0] = midx / max(n_months - 1, 1)
+        try:
+            mo = int(month_str.split('-')[1])
+            tp_feat[midx, 1] = np.sin(2 * np.pi * mo / 12)
+            tp_feat[midx, 2] = np.cos(2 * np.pi * mo / 12)
+        except (IndexError, ValueError):
+            pass
     feats['TimePeriod'] = tp_feat
     print(f"  TimePeriod features: {tp_feat.shape}")
 
