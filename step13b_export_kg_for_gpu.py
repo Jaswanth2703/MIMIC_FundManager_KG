@@ -282,6 +282,16 @@ def process_holds(holds_data, maps, df):
             key = (str(row['ISIN']), str(row['year_month_str']))
             df_lookup[key] = row
 
+    # Pre-compute the exact feature columns we'll use (fixed width for all rows)
+    use_cols = [c for c in HOLDS_FEATURES if c in df.columns]
+    n_feats = len(use_cols)
+    # Map for fallback: column name → Neo4j key
+    neo4j_key_map = {
+        'pct_nav': 'pct_nav', 'holding_tenure': 'tenure',
+        'rsi': 'rsi', 'monthly_return': 'm_return',
+        'sentiment_mean': 'sentiment',
+    }
+
     for r in holds_data:
         fi = maps['Fund'].get(r['fund'], -1)
         si = maps['Stock'].get(r['isin'], -1)
@@ -298,18 +308,13 @@ def process_holds(holds_data, maps, df):
         key = (r['isin'], month)
         row = df_lookup.get(key)
         if row is not None:
-            feat = [float(row.get(c, 0.0) or 0.0) for c in HOLDS_FEATURES if c in df.columns]
+            feat = [float(row.get(c, 0.0) or 0.0) for c in use_cols]
         else:
-            # Fallback: use what Neo4j returned
-            feat = [
-                float(r.get('pct_nav', 0) or 0),
-                float(r.get('tenure', 0) or 0),
-                0.0,  # allocation_change_lag1
-                float(r.get('rsi', 0) or 0),
-                0.0, 0.0,  # bollinger, momentum
-                float(r.get('m_return', 0) or 0),
-                float(r.get('sentiment', 0) or 0),
-            ] + [0.0] * (len(HOLDS_FEATURES) - 8)
+            # Fallback: use what Neo4j returned, same column order & count
+            feat = []
+            for c in use_cols:
+                nk = neo4j_key_map.get(c)
+                feat.append(float(r.get(nk, 0) or 0) if nk else 0.0)
 
         fund_idx.append(fi)
         stock_idx.append(si)
@@ -320,11 +325,7 @@ def process_holds(holds_data, maps, df):
         stock_isins_list.append(str(r.get('isin', '')))
         month_strs_list.append(month)
 
-    n_feats = len([c for c in HOLDS_FEATURES if c in df.columns]) if df is not None else 8
     feat_arr = np.array(feat_rows, dtype=np.float32)
-    if feat_arr.shape[1] < n_feats:
-        pad = np.zeros((len(feat_rows), n_feats - feat_arr.shape[1]), dtype=np.float32)
-        feat_arr = np.hstack([feat_arr, pad])
 
     return {
         'edge_index': np.array([fund_idx, stock_idx], dtype=np.int64),
