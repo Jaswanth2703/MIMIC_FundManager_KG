@@ -256,7 +256,7 @@ def feature_group_ablation(df, all_features, feature_groups):
 # Ablation Study 2: Causal Method Ablation
 # ============================================================
 def causal_method_ablation(df, feature_groups):
-    """Compare different causal discovery methods."""
+    """Compare different causal discovery methods and confidence thresholds."""
     print("\n  === ABLATION 2: Causal Methods ===")
     results = {}
 
@@ -283,8 +283,19 @@ def causal_method_ablation(df, feature_groups):
         dml_feats = set(dml_df[dml_df['significant'] == True]['treatment'].unique()) \
             & set(df.columns)
 
+    # ICP features at different confidence thresholds
+    icp_high = set()
+    icp_medium = set()
+    if icp_df is not None:
+        icp_high = set(icp_df[icp_df['confidence'] >= 0.50]['variable'].unique()) \
+            & set(df.columns)
+        icp_medium = set(icp_df[icp_df['confidence'] >= 0.10]['variable'].unique()) \
+            & set(df.columns)
+
     print(f"    Granger features: {len(granger_feats)}")
-    print(f"    ICP features: {len(icp_feats)}")
+    print(f"    ICP features (>=0.25): {len(icp_feats)}")
+    print(f"    ICP features (>=0.50): {len(icp_high)}")
+    print(f"    ICP features (>=0.10): {len(icp_medium)}")
     print(f"    DML features: {len(dml_feats)}")
 
     all_numeric = [c for c in df.select_dtypes(include=[np.number]).columns
@@ -301,12 +312,16 @@ def causal_method_ablation(df, feature_groups):
     methods = {
         'all_features': set(all_numeric),
         'granger_only': granger_feats,
-        'icp_only': icp_feats,
+        'icp_only_conf25': icp_feats,
+        'icp_only_conf50': icp_high,
+        'icp_only_conf10': icp_medium,
         'dml_only': dml_feats,
         'granger_intersection_icp': granger_feats & icp_feats,
         'granger_union_icp': granger_feats | icp_feats,
         'all_causal_union': granger_feats | icp_feats | dml_feats,
         'all_causal_intersection': granger_feats & icp_feats & dml_feats,
+        'dml_intersection_icp': dml_feats & icp_feats,
+        'granger_intersection_dml': granger_feats & dml_feats,
     }
 
     for method_name, feats in methods.items():

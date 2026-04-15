@@ -406,14 +406,12 @@ def build_vocabularies(paths):
 # 4. Path-based prediction model (Transformer)
 # ============================================================
 def build_path_model_torch(max_hops, n_node_types, n_edge_types,
-                           node_vocab_size, n_classes=3, d_model=64):
+                           node_vocab_size, n_classes=3, d_model=128):
     """Build a Transformer-based path prediction model.
 
     Architecture:
         PathEncoder: embed(node_type) + embed(node_id) + embed(edge_type) + linear(edge_feats)
                      -> Transformer encoder -> classification head
-
-    This model learns the DECISION PROCESS from paths, not just features.
     """
     try:
         import torch
@@ -431,15 +429,15 @@ def build_path_model_torch(max_hops, n_node_types, n_edge_types,
             self.edge_feat_proj = nn.Linear(MAX_EDGE_FEATURES, d_model // 4)
 
             encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model, nhead=4, dim_feedforward=d_model * 2,
-                dropout=0.1, batch_first=True
+                d_model=d_model, nhead=8, dim_feedforward=d_model * 4,
+                dropout=0.1, batch_first=True, activation='gelu'
             )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
             self.classifier = nn.Sequential(
                 nn.LayerNorm(d_model),
                 nn.Linear(d_model, d_model),
                 nn.GELU(),
-                nn.Dropout(0.1),
+                nn.Dropout(0.15),
                 nn.Linear(d_model, n_classes)
             )
 
@@ -510,7 +508,7 @@ def train_path_model(paths, train_months_list, test_months_list):
         n_node_types=len(NODE_TYPE_VOCAB),
         n_edge_types=len(EDGE_TYPE_VOCAB),
         node_vocab_size=len(vocab),
-        n_classes=3, d_model=64
+        n_classes=3, d_model=128
     )
     if model is None:
         return _sklearn_fallback(paths, train_months_list, test_months_list)
@@ -537,8 +535,14 @@ def train_path_model(paths, train_months_list, test_months_list):
     weights = torch.FloatTensor([total / (3 * label_counts.get(i, 1)) for i in range(3)]).to(device)
 
     criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+    # Warmup + cosine annealing schedule
+    warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (EPOCHS - warmup_epochs)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Training loop
     best_val_loss = float('inf')
@@ -580,7 +584,7 @@ def train_path_model(paths, train_months_list, test_months_list):
             val_logits = model(test_data[0], test_data[1], test_data[2], test_data[3])
             val_loss = criterion(val_logits, test_data[4]).item()
 
-        scheduler.step(val_loss)
+        scheduler.step()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss

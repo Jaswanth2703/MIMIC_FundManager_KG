@@ -332,10 +332,13 @@ def generate_csv_explanation(stock, month, fund, predicted, features_row,
 # 3. Counterfactual explanation generation
 # ============================================================
 def generate_counterfactual(stock, predicted, top_driver, causal_evidence):
-    """Generate a counterfactual explanation.
+    """Generate a counterfactual explanation with confidence assessment.
 
     "If <driver> had been <opposite>, the prediction might have been <opposite_action>
      because the causal path through the KG would propagate differently."
+    
+    Includes DML confidence interval check: if CI crosses zero, the
+    counterfactual is UNCERTAIN (the effect may not be real).
     """
     ev = causal_evidence.get(top_driver, {})
     if not ev:
@@ -343,6 +346,15 @@ def generate_counterfactual(stock, predicted, top_driver, causal_evidence):
 
     direction = ev.get('dml_direction', '')
     theta = ev.get('dml_theta', ev.get('granger_beta', 0))
+
+    # Assess counterfactual confidence via DML CI
+    ci_lower = ev.get('dml_ci_lower', None)
+    ci_upper = ev.get('dml_ci_upper', None)
+    if ci_lower is not None and ci_upper is not None:
+        ci_crosses_zero = (ci_lower <= 0 <= ci_upper)
+        cf_confidence = 'LOW (CI crosses zero)' if ci_crosses_zero else 'HIGH'
+    else:
+        cf_confidence = 'MODERATE (no CI available)'
 
     if predicted in ('SELL', 'DECREASE'):
         cf_action = 'HOLD or BUY'
@@ -357,19 +369,21 @@ def generate_counterfactual(stock, predicted, top_driver, causal_evidence):
     return (f"COUNTERFACTUAL: If {top_driver} had been {cf_direction}, "
             f"the prediction might have changed from {predicted} to {cf_action}. "
             f"Causal evidence: effect size = {theta:+.4f}, "
-            f"direction = {direction}.")
+            f"direction = {direction}. "
+            f"Confidence: {cf_confidence}.")
 
 
 # ============================================================
 # 4. Explanation quality metrics
 # ============================================================
 def evaluate_quality(explanations, causal_evidence):
-    """Compute explanation quality metrics."""
+    """Compute explanation quality metrics with faithfulness assessment."""
     n = len(explanations)
     if n == 0:
         return {}
 
     faith_scores = []
+    ci_faith_scores = []   # DML CI-based faithfulness
     has_kg_path = 0
     has_icp = 0
     has_dml = 0
@@ -386,6 +400,11 @@ def evaluate_quality(explanations, causal_evidence):
         in_kg = sum(1 for f in feats if f in causal_evidence)
         faith_scores.append(in_kg / max(len(feats), 1))
 
+        # CI-based faithfulness: fraction of cited vars with significant DML
+        sig_count = sum(1 for f in feats
+                        if causal_evidence.get(f, {}).get('dml_significant', False))
+        ci_faith_scores.append(sig_count / max(len(feats), 1))
+
         layers = e.get('evidence_layers', {})
         if layers.get('kg_path'):
             has_kg_path += 1
@@ -399,7 +418,7 @@ def evaluate_quality(explanations, causal_evidence):
             has_cbr += 1
         if e.get('counterfactual'):
             has_counterfactual += 1
-        if e.get('regime'):
+        if e.get('regime') and e.get('regime') != 'UNKNOWN':
             has_regime += 1
         if e.get('portfolio_context'):
             has_portfolio_ctx += 1
@@ -407,6 +426,7 @@ def evaluate_quality(explanations, causal_evidence):
     return {
         'n_explanations': n,
         'avg_faithfulness': float(np.mean(faith_scores)),
+        'avg_ci_faithfulness': float(np.mean(ci_faith_scores)),
         'pct_with_kg_paths': float(has_kg_path / n),
         'pct_with_icp_evidence': float(has_icp / n),
         'pct_with_dml_ci': float(has_dml / n),

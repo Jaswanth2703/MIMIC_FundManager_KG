@@ -284,6 +284,30 @@ def main():
     # --- Run BOTH evaluation modes ---
     all_results = {}
 
+    # Naive baseline: always predict HOLD (class 1)
+    data_tmp = df.dropna(subset=['position_action']).copy()
+    data_tmp['target'] = data_tmp['position_action'].map(ACTION_MAP)
+    data_tmp = data_tmp.dropna(subset=['target'])
+    naive_true = data_tmp['target'].astype(int).tolist()
+    naive_pred = [1] * len(naive_true)  # always HOLD
+    naive_metrics = compute_mimicry_metrics(naive_true, naive_pred)
+    for mode in ['walk_forward', 'temporal_holdout']:
+        all_results[f'M_naive_HOLD__{mode}'] = {
+            'model': 'M_naive_HOLD',
+            'eval_mode': mode,
+            'status': 'success',
+            'n_features': 0,
+            'accuracy': naive_metrics['accuracy'],
+            'f1_weighted': naive_metrics['f1_weighted'],
+            'cohens_kappa': naive_metrics['cohens_kappa'],
+            'decision_agreement': naive_metrics['decision_agreement'],
+            'buy_recall': naive_metrics.get('buy_recall', 0),
+            'sell_recall': naive_metrics.get('sell_recall', 0),
+            'note': 'Naive baseline: always predicts HOLD',
+        }
+    print(f"\n  Naive HOLD baseline: acc={naive_metrics['accuracy']:.3f} "
+          f"kappa={naive_metrics['cohens_kappa']:.3f}")
+
     for eval_mode in ['walk_forward', 'temporal_holdout']:
         print(f"\n{'='*70}")
         print(f"  EVALUATION MODE: {eval_mode.upper()}")

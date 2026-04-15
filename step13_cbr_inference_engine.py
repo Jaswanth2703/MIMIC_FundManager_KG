@@ -117,6 +117,56 @@ class SubgraphExtractor:
         with self.driver.session() as s:
             return s.run(cypher, params).data()
 
+    def _prefetch_global_context(self):
+        """Pre-fetch causal drivers, ICP parents, and regime data in bulk."""
+        self._drivers_cache = self._run("""
+            MATCH (cv:CausalVariable)-[r:GRANGER_CAUSES]->(t:CausalVariable)
+            WHERE r.significant = true
+            RETURN cv.name AS driver, t.name AS target,
+                   r.beta AS beta, r.lag AS lag
+            ORDER BY abs(r.beta) DESC LIMIT 10
+        """)
+        self._icp_cache = self._run("""
+            MATCH (cv:CausalVariable)-[r:CAUSES]->(t:CausalVariable)
+            RETURN cv.name AS parent, t.name AS child, r.confidence AS conf
+            ORDER BY r.confidence DESC LIMIT 8
+        """)
+        self._regime_cache = {}
+        regimes = self._run("""
+            MATCH (t:TimePeriod)-[:IN_REGIME]->(mr:MarketRegime)
+            RETURN t.id AS month, mr.regime_type AS regime
+        """)
+        for r in regimes:
+            self._regime_cache[r['month']] = r['regime']
+
+    def _prefetch_holds_batch(self, df):
+        """Pre-fetch ALL HOLDS data in one query instead of per-row."""
+        months = list(df['year_month_str'].unique())
+        funds = list(df['Fund_Name'].unique())
+        all_holds = self._run("""
+            MATCH (f:Fund)-[h:HOLDS]->(s:Stock)
+            WHERE h.month IN $months AND f.name IN $funds
+            RETURN f.name AS fund, s.isin AS isin, h.month AS month,
+                   h.pct_nav AS pct_nav, h.holding_tenure AS tenure,
+                   h.position_action AS action,
+                   COALESCE(h.monthly_return, 0) AS ret,
+                   h.rank AS rank, h.consensus AS consensus,
+                   s.name AS stock_name, s.sector AS sector
+        """, months=months, funds=funds)
+        # Index by (fund, isin, month) for O(1) lookup
+        self._holds_idx = {}
+        # Index by (fund, month) for portfolio context
+        self._portfolio_idx = {}
+        for h in all_holds:
+            key = (h['fund'], h['isin'], h['month'])
+            self._holds_idx[key] = h
+            pkey = (h['fund'], h['month'])
+            if pkey not in self._portfolio_idx:
+                self._portfolio_idx[pkey] = []
+            self._portfolio_idx[pkey].append(h)
+        print(f"    Pre-fetched {len(all_holds)} HOLDS edges "
+              f"({len(self._portfolio_idx)} fund-month combos)")
+
     def extract_subgraph(self, fund_name, isin, month):
         """Extract a multi-relational subgraph for one decision.
 
@@ -125,19 +175,14 @@ class SubgraphExtractor:
         """
         edges = []
 
-        # 1. Fund -[HOLDS {month}]-> Stock (the decision itself)
-        holds = self._run("""
-            MATCH (f:Fund {name: $fund})-[h:HOLDS {month: $month}]->(s:Stock {isin: $isin})
-            RETURN h.pct_nav AS pct_nav, h.holding_tenure AS tenure,
-                   h.position_action AS action, COALESCE(h.monthly_return, 0) AS ret,
-                   h.rank AS rank, h.consensus AS consensus,
-                   s.name AS stock_name, s.sector AS sector
-        """, fund=fund_name, month=month, isin=isin)
-        if holds:
-            h = holds[0]
+        # 1. Fund -[HOLDS {month}]-> Stock (from pre-fetched cache)
+        key = (fund_name, isin, month)
+        h = self._holds_idx.get(key)
+        if h:
             edges.append(('Fund:' + fund_name, 'HOLDS', 'Stock:' + isin,
                           {k: v for k, v in h.items()
-                           if v is not None and k not in ('stock_name', 'sector')}))
+                           if v is not None and k not in
+                           ('stock_name', 'sector', 'fund', 'isin', 'month')}))
             sector = h.get('sector', 'OTHERS')
         else:
             edges.append(('Fund:' + fund_name, 'HOLDS', 'Stock:' + isin, {}))
@@ -146,52 +191,34 @@ class SubgraphExtractor:
         # 2. Stock -[BELONGS_TO]-> Sector
         edges.append(('Stock:' + isin, 'BELONGS_TO', 'Sector:' + sector, {}))
 
-        # 3. TimePeriod -[IN_REGIME]-> MarketRegime
-        regime = self._run("""
-            MATCH (t:TimePeriod {id: $month})-[:IN_REGIME]->(mr:MarketRegime)
-            RETURN mr.regime_type AS regime
-        """, month=month)
-        regime_name = regime[0]['regime'] if regime else 'UNKNOWN'
+        # 3. TimePeriod -[IN_REGIME]-> MarketRegime (from cache)
+        regime_name = self._regime_cache.get(month, 'UNKNOWN')
         edges.append(('TimePeriod:' + month, 'IN_REGIME',
                        'MarketRegime:' + regime_name, {}))
 
-        # 4. CausalVariable -[GRANGER_CAUSES]-> target (top drivers)
-        drivers = self._run("""
-            MATCH (cv:CausalVariable)-[r:GRANGER_CAUSES]->(t:CausalVariable)
-            WHERE r.significant = true
-            RETURN cv.name AS driver, t.name AS target,
-                   r.beta AS beta, r.lag AS lag
-            ORDER BY abs(r.beta) DESC LIMIT 10
-        """)
-        for d in drivers:
+        # 4. CausalVariable -[GRANGER_CAUSES]-> target (from cache)
+        for d in self._drivers_cache:
             edges.append(('CausalVar:' + d['driver'], 'GRANGER_CAUSES',
                           'CausalVar:' + d['target'],
                           {'beta': d.get('beta'), 'lag': d.get('lag')}))
 
         # 5. Portfolio context: other stocks the fund holds this month
-        peers = self._run("""
-            MATCH (f:Fund {name: $fund})-[h:HOLDS {month: $month}]->(s:Stock)
-            WHERE s.isin <> $isin
-            RETURN s.isin AS peer_isin, s.sector AS peer_sector,
-                   h.pct_nav AS peer_nav
-            ORDER BY h.pct_nav DESC LIMIT $limit
-        """, fund=fund_name, month=month, isin=isin, limit=MAX_PORTFOLIO_PEERS)
-        for p in peers:
-            pisin = p.get('peer_isin', '')
+        pkey = (fund_name, month)
+        peers = self._portfolio_idx.get(pkey, [])
+        for p in sorted(peers, key=lambda x: x.get('pct_nav') or 0,
+                         reverse=True)[:MAX_PORTFOLIO_PEERS]:
+            pisin = p.get('isin', '')
+            if pisin == isin:
+                continue
             edges.append(('Fund:' + fund_name, 'HOLDS',
                           'Stock:' + pisin,
-                          {'pct_nav': p.get('peer_nav')}))
-            psec = p.get('peer_sector', 'OTHERS')
+                          {'pct_nav': p.get('pct_nav')}))
+            psec = p.get('sector', 'OTHERS')
             edges.append(('Stock:' + pisin, 'BELONGS_TO',
                           'Sector:' + psec, {}))
 
-        # 6. ICP causal parents
-        icp_edges = self._run("""
-            MATCH (cv:CausalVariable)-[r:CAUSES]->(t:CausalVariable)
-            RETURN cv.name AS parent, t.name AS child, r.confidence AS conf
-            ORDER BY r.confidence DESC LIMIT 8
-        """)
-        for ie in icp_edges:
+        # 6. ICP causal parents (from cache)
+        for ie in self._icp_cache:
             edges.append(('CausalVar:' + ie['parent'], 'CAUSES',
                           'CausalVar:' + ie['child'],
                           {'confidence': ie.get('conf')}))
@@ -199,12 +226,19 @@ class SubgraphExtractor:
         return edges
 
     def extract_batch(self, df, max_rows=5000):
-        """Extract subgraphs for a batch of decisions."""
-        subgraphs = []
+        """Extract subgraphs for a batch of decisions using bulk pre-fetch."""
         total = min(len(df), max_rows)
-        for idx, (_, row) in enumerate(df.head(total).iterrows()):
-            if idx % 500 == 0 and idx > 0:
-                print(f"    Extracting subgraphs: {idx}/{total}")
+        batch_df = df.head(total)
+
+        # Pre-fetch ALL data in bulk (3 queries instead of 83K+)
+        print(f"    Pre-fetching KG data for {total} decisions...")
+        self._prefetch_global_context()
+        self._prefetch_holds_batch(batch_df)
+
+        subgraphs = []
+        for idx, (_, row) in enumerate(batch_df.iterrows()):
+            if idx % 2000 == 0 and idx > 0:
+                print(f"    Building subgraphs: {idx}/{total}")
             sg = self.extract_subgraph(
                 row['Fund_Name'], row['ISIN'], row['year_month_str'])
             subgraphs.append(sg)

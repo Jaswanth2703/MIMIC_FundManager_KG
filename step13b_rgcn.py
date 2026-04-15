@@ -292,24 +292,35 @@ class CIHGTFundModel(nn.Module):
 
             # NOVEL: Apply causal gates to CausalVariable embeddings
             if 'CausalVariable' in h_new and edge_attr_dict:
-                causal_emb = h_new['CausalVariable']
+                causal_emb = h_new['CausalVariable'].clone()
                 for etype, gate in self.causal_gates.items():
                     if etype in edge_attr_dict and edge_attr_dict[etype] is not None:
-                        ea = edge_attr_dict[etype]
-                        # Aggregate causal edge attributes to target nodes
                         ei_key = ('CausalVariable', etype, 'CausalVariable')
                         if ei_key in edge_index_dict:
                             ei = edge_index_dict[ei_key]
-                            target_idx = ei[1]
-                            # Mean gate value per target node
-                            gate_vals = gate(
-                                causal_emb[target_idx],
-                                ea[:causal_emb[target_idx].shape[0]]
+                            src_idx, tgt_idx = ei[0], ei[1]
+                            ea = edge_attr_dict[etype]
+                            n_edges = ei.shape[1]
+                            # Gate source-node messages using causal edge attributes
+                            gated_msg = gate(causal_emb[src_idx], ea[:n_edges])
+                            # Scatter-mean aggregation to target nodes
+                            n_nodes = causal_emb.shape[0]
+                            agg_sum = torch.zeros(n_nodes, gated_msg.shape[1],
+                                                  device=causal_emb.device)
+                            agg_cnt = torch.zeros(n_nodes, 1,
+                                                  device=causal_emb.device)
+                            agg_sum.index_add_(0, tgt_idx, gated_msg)
+                            agg_cnt.index_add_(0, tgt_idx,
+                                               torch.ones(n_edges, 1,
+                                                          device=causal_emb.device))
+                            has_incoming = (agg_cnt > 0).squeeze(-1)
+                            agg_mean = agg_sum / agg_cnt.clamp(min=1)
+                            # Scaled residual update (preserves gradient flow)
+                            causal_emb[has_incoming] = (
+                                causal_emb[has_incoming]
+                                + 0.1 * (agg_mean[has_incoming]
+                                         - causal_emb[has_incoming])
                             )
-                            # Scatter-add gated messages (approximate)
-                            causal_emb = causal_emb.clone()
-                            causal_emb.index_add_(0, target_idx,
-                                                   gate_vals - causal_emb[target_idx])
                 h_new['CausalVariable'] = causal_emb
 
             # Residual + norm
