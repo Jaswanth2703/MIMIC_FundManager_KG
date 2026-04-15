@@ -1,8 +1,7 @@
 """
 step13b_rgcn.py  --  HGT + Causally-Informed HGT (CI-HGT) for Fund Manager KG
 ================================================================================
-STANDALONE — no project imports, no Neo4j, no config.py needed.
-Copy this file + data/rgcn/kg_export.pkl to your GPU machine and run.
+Queries Neo4j directly — no separate export step needed.
 
 TWO architectures:
 
@@ -34,22 +33,23 @@ Usage:
   python step13b_rgcn.py --model hgt    # HGT only
   python step13b_rgcn.py --model ci-hgt # CI-HGT only (novel)
 
-Input:
-  data/rgcn/kg_export.pkl  (from step13b_export_kg_for_gpu.py)
-
 Output:
   data/rgcn/rgcn_results.json   (both models' metrics)
   data/rgcn/rgcn_model.pt       (best model weights)
   data/rgcn/ci_hgt_model.pt     (CI-HGT model weights)
 
-Requirements (install with setup_gpu.bat):
-  torch>=2.1  torch-geometric  torch-sparse  torch-scatter
+Requirements:
+  torch>=2.1  torch-geometric  torch-sparse  torch-scatter  neo4j
 """
 
-import os, sys, json, pickle, warnings, time, argparse
+import os, sys, json, warnings, time, argparse
 import numpy as np
+import pandas as pd
 
 warnings.filterwarnings('ignore')
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import FEATURES_DIR, CAUSAL_DIR, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 
 # ---- check dependencies ----
 try:
@@ -65,9 +65,14 @@ except ImportError:
 try:
     from torch_geometric.data import HeteroData
     from torch_geometric.nn import HGTConv, Linear
-    from torch_geometric.transforms import ToUndirected
 except ImportError:
     print("ERROR: pip install torch-geometric torch-scatter torch-sparse")
+    sys.exit(1)
+
+try:
+    from neo4j import GraphDatabase
+except ImportError:
+    print("ERROR: pip install neo4j")
     sys.exit(1)
 
 from sklearn.metrics import accuracy_score, f1_score, classification_report
@@ -75,9 +80,13 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report
 # ---- paths ----
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR    = os.path.join(SCRIPT_DIR, 'data', 'rgcn')
-INPUT_PKL   = os.path.join(DATA_DIR, 'kg_export.pkl')
+FINAL_DIR   = os.path.join(SCRIPT_DIR, 'data', 'final')
 OUTPUT_JSON = os.path.join(DATA_DIR, 'rgcn_results.json')
 OUTPUT_PT   = os.path.join(DATA_DIR, 'rgcn_model.pt')
+
+INPUT_FEAT = os.path.join(FEATURES_DIR, 'LPCMCI_READY.csv')
+INPUT_ICP  = os.path.join(CAUSAL_DIR,   'icp_causal_parents.csv')
+INPUT_DML  = os.path.join(CAUSAL_DIR,   'dml_causal_effects.csv')
 
 # ---- hyperparameters ----
 HIDDEN_DIM   = 128
@@ -87,8 +96,296 @@ DROPOUT      = 0.3
 LR           = 3e-4
 WEIGHT_DECAY = 1e-4
 EPOCHS       = 80
-PATIENCE     = 15     # early stopping
-BATCH_HOLDS  = 4096   # process HOLDS edges in batches for memory efficiency
+PATIENCE     = 15
+BATCH_HOLDS  = 4096
+
+ACTION_MAP = {'BUY':2,'INCREASE':2,'INITIAL_POSITION':2,'HOLD':1,'DECREASE':0,'SELL':0}
+
+HOLDS_FEATURES = [
+    'pct_nav', 'holding_tenure', 'allocation_change_lag1',
+    'rsi', 'bollinger_pband', 'momentum_3m', 'monthly_return',
+    'sentiment_mean', 'market_cap', 'beta', 'pe', 'pb',
+    'india_vix_close', 'repo_rate', 'cpi_inflation',
+]
+
+
+# ====================================================================
+# Utilities
+# ====================================================================
+
+def _safe_float(v):
+    """Convert to float, replacing NaN/Inf/None with 0."""
+    try:
+        f = float(v) if v is not None else 0.0
+        return f if np.isfinite(f) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def query_neo4j(driver, cypher):
+    with driver.session() as s:
+        return s.run(cypher).data()
+
+
+# ====================================================================
+# KG Data Loading (direct from Neo4j — replaces step13b_export)
+# ====================================================================
+
+def load_kg_from_neo4j(driver, df, icp_df, dml_df):
+    """Query Neo4j and build all tensors needed for HGT training."""
+
+    # -- Node maps --
+    maps = {}
+    funds = query_neo4j(driver, "MATCH (n:Fund) RETURN n.name AS name ORDER BY n.name")
+    maps['Fund'] = {r['name']: i for i, r in enumerate(funds)}
+
+    stocks = query_neo4j(driver, "MATCH (n:Stock) RETURN n.isin AS isin ORDER BY n.isin")
+    maps['Stock'] = {r['isin']: i for i, r in enumerate(stocks) if r['isin']}
+
+    sectors = query_neo4j(driver, "MATCH (n:Sector) RETURN n.name AS name ORDER BY n.name")
+    maps['Sector'] = {r['name']: i for i, r in enumerate(sectors)}
+
+    months = query_neo4j(driver, "MATCH (n:TimePeriod) RETURN n.id AS month ORDER BY n.id")
+    valid_months = [r['month'] for r in months if r['month']]
+    maps['TimePeriod'] = {m: i for i, m in enumerate(valid_months)}
+
+    cvars = query_neo4j(driver, "MATCH (n:CausalVariable) RETURN n.name AS name ORDER BY n.name")
+    maps['CausalVariable'] = {r['name']: i for i, r in enumerate(cvars)}
+
+    print(f"  Nodes: Fund={len(maps['Fund'])} Stock={len(maps['Stock'])} "
+          f"Sector={len(maps['Sector'])} TimePeriod={len(maps['TimePeriod'])} "
+          f"CausalVar={len(maps['CausalVariable'])}")
+
+    # -- Node features --
+    node_features = {}
+
+    # Fund: type + aggregate stats
+    n_funds = len(maps['Fund'])
+    fund_feat = np.zeros((n_funds, 4), dtype=np.float32)
+    if 'Fund_Type' in df.columns and 'Fund_Name' in df.columns:
+        for fname, fidx in maps['Fund'].items():
+            rows = df[df['Fund_Name'] == fname]
+            if len(rows) == 0:
+                continue
+            ft = str(rows['Fund_Type'].iloc[0]).lower()
+            fund_feat[fidx, 0] = 1.0 if 'small' in ft else 0.0
+            fund_feat[fidx, 1] = 1.0 if 'mid' in ft else 0.0
+            fund_feat[fidx, 2] = _safe_float(rows['pct_nav'].mean()) if 'pct_nav' in df.columns else 0.0
+            fund_feat[fidx, 3] = _safe_float(rows['holding_tenure'].mean()) if 'holding_tenure' in df.columns else 0.0
+    node_features['Fund'] = fund_feat
+
+    # Stock: mean features
+    n_stocks = len(maps['Stock'])
+    stock_cols = [c for c in ['pct_nav','holding_tenure','rsi','monthly_return',
+                              'sentiment_mean'] if c in df.columns]
+    stock_feat = np.zeros((n_stocks, max(len(stock_cols), 1)), dtype=np.float32)
+    if 'ISIN' in df.columns:
+        for isin, sidx in maps['Stock'].items():
+            rows = df[df['ISIN'] == isin]
+            for j, col in enumerate(stock_cols):
+                stock_feat[sidx, j] = _safe_float(rows[col].mean()) if len(rows) > 0 else 0.0
+    node_features['Stock'] = stock_feat
+
+    # Sector: one-hot
+    node_features['Sector'] = np.eye(len(maps['Sector']), dtype=np.float32)
+
+    # TimePeriod: normalized index + cyclical month encoding
+    n_tp = len(maps['TimePeriod'])
+    tp_feat = np.zeros((n_tp, 3), dtype=np.float32)
+    for mstr, midx in maps['TimePeriod'].items():
+        tp_feat[midx, 0] = midx / max(n_tp - 1, 1)
+        try:
+            mo = int(mstr.split('-')[1])
+            tp_feat[midx, 1] = np.sin(2 * np.pi * mo / 12)
+            tp_feat[midx, 2] = np.cos(2 * np.pi * mo / 12)
+        except (IndexError, ValueError):
+            pass
+    node_features['TimePeriod'] = tp_feat
+
+    # CausalVariable: category one-hot + DML theta
+    categories = ['price_momentum','position_size','herding','risk',
+                  'macro_rates','macro_equity','sentiment','fundamentals','other']
+    n_cvars = len(maps['CausalVariable'])
+    cv_feat = np.zeros((n_cvars, len(categories) + 1), dtype=np.float32)
+    dml_theta = {}
+    if dml_df is not None:
+        ao = dml_df[dml_df['outcome'] == 'action_ordinal']
+        for _, row in ao.iterrows():
+            dml_theta[row['treatment']] = _safe_float(row['theta_hat'])
+    for cname, cidx in maps['CausalVariable'].items():
+        n = cname.lower()
+        cat = 'other'
+        if any(s in n for s in ['rsi','macd','bollinger','momentum','monthly_return']):
+            cat = 'price_momentum'
+        elif any(s in n for s in ['pct_nav','holding_tenure','allocation_change']):
+            cat = 'position_size'
+        elif any(s in n for s in ['sector_hhi','sector_weight','fund_overlap']):
+            cat = 'herding'
+        elif any(s in n for s in ['volatility','beta','drawdown','vix']):
+            cat = 'risk'
+        elif any(s in n for s in ['repo_rate','yield','libor']):
+            cat = 'macro_rates'
+        elif any(s in n for s in ['nifty','sensex','market_return']):
+            cat = 'macro_equity'
+        elif any(s in n for s in ['sentiment','news','nlp']):
+            cat = 'sentiment'
+        elif any(s in n for s in ['pe','pb','eps','market_cap']):
+            cat = 'fundamentals'
+        if cat in categories:
+            cv_feat[cidx, categories.index(cat)] = 1.0
+        cv_feat[cidx, -1] = dml_theta.get(cname, 0.0)
+    node_features['CausalVariable'] = cv_feat
+
+    # Sanitize all node features
+    for ntype in node_features:
+        node_features[ntype] = np.nan_to_num(node_features[ntype], nan=0.0, posinf=0.0, neginf=0.0)
+
+    # -- Edges --
+    edges = {}
+
+    # BELONGS_TO
+    bt_data = query_neo4j(driver, "MATCH (s:Stock)-[:BELONGS_TO]->(sec:Sector) RETURN s.isin AS isin, sec.name AS sector")
+    bt_src = [maps['Stock'].get(r['isin'], -1) for r in bt_data]
+    bt_dst = [maps['Sector'].get(r['sector'], -1) for r in bt_data]
+    valid = [i for i, (s, d) in enumerate(zip(bt_src, bt_dst)) if s >= 0 and d >= 0]
+    edges['BELONGS_TO'] = np.array([[bt_src[i], bt_dst[i]] for i in valid], dtype=np.int64).T if valid else np.zeros((2,0), dtype=np.int64)
+    print(f"  BELONGS_TO: {len(valid)} edges")
+
+    # Causal edges
+    for ename, cypher in [
+        ('GRANGER_CAUSES', """
+            MATCH (c:CausalVariable)-[r:GRANGER_CAUSES]->(t:CausalVariable)
+            WHERE r.significant = true
+            RETURN c.name AS src, t.name AS dst,
+                   r.beta AS beta, r.lag AS lag, r.p_value AS pval"""),
+        ('CAUSES', """
+            MATCH (c:CausalVariable)-[r:CAUSES]->(t:CausalVariable)
+            RETURN c.name AS src, t.name AS dst,
+                   r.confidence AS conf, r.in_intersection AS cert"""),
+        ('CAUSAL_EFFECT', """
+            MATCH (c:CausalVariable)-[r:CAUSAL_EFFECT]->(t:CausalVariable)
+            WHERE r.significant = true
+            RETURN c.name AS src, t.name AS dst,
+                   r.theta_hat AS theta, r.icp_certified AS cert"""),
+    ]:
+        data_rows = query_neo4j(driver, cypher)
+        src_idx = [maps['CausalVariable'].get(r['src'], -1) for r in data_rows]
+        dst_idx = [maps['CausalVariable'].get(r['dst'], -1) for r in data_rows]
+        valid = [i for i, (s, d) in enumerate(zip(src_idx, dst_idx)) if s >= 0 and d >= 0]
+
+        if ename == 'GRANGER_CAUSES':
+            attr = [[abs(_safe_float(data_rows[i].get('beta'))),
+                      _safe_float(data_rows[i].get('lag')),
+                      1.0 - _safe_float(data_rows[i].get('pval'))] for i in valid]
+        elif ename == 'CAUSES':
+            attr = [[_safe_float(data_rows[i].get('conf')),
+                      1.0 if data_rows[i].get('cert') else 0.0] for i in valid]
+        else:
+            attr = [[_safe_float(data_rows[i].get('theta')),
+                      1.0 if data_rows[i].get('cert') else 0.0] for i in valid]
+
+        edges[ename] = {
+            'index': np.array([[src_idx[i], dst_idx[i]] for i in valid], dtype=np.int64).T if valid else np.zeros((2,0), dtype=np.int64),
+            'attr':  np.array(attr, dtype=np.float32) if valid else np.zeros((0, 3 if ename == 'GRANGER_CAUSES' else 2), dtype=np.float32),
+        }
+        print(f"  {ename}: {len(valid)} edges")
+
+    # -- HOLDS edges (the main prediction target) --
+    print("  Querying HOLDS edges...")
+    holds_data = query_neo4j(driver, """
+        MATCH (f:Fund)-[h:HOLDS]->(s:Stock)
+        RETURN f.name AS fund, s.isin AS isin, h.month AS month,
+               h.pct_nav AS pct_nav, h.holding_tenure AS tenure,
+               h.allocation_change AS alloc_change, h.rsi AS rsi,
+               h.sentiment_score AS sentiment,
+               COALESCE(h.monthly_return, 0) AS m_return,
+               h.position_action AS action
+        ORDER BY h.month
+    """)
+    print(f"  HOLDS rows from Neo4j: {len(holds_data)}")
+
+    # Feature columns present in df
+    use_cols = [c for c in HOLDS_FEATURES if c in df.columns]
+    all_months_sorted = sorted(maps['TimePeriod'].keys())
+    month_to_idx = {m: i for i, m in enumerate(all_months_sorted)}
+
+    # Build df lookup for fast feature retrieval
+    df_lookup = {}
+    if 'ISIN' in df.columns and 'year_month_str' in df.columns:
+        for _, row in df.iterrows():
+            df_lookup[(str(row['ISIN']), str(row['year_month_str']))] = row
+
+    neo4j_key_map = {
+        'pct_nav': 'pct_nav', 'holding_tenure': 'tenure',
+        'rsi': 'rsi', 'monthly_return': 'm_return',
+        'sentiment_mean': 'sentiment',
+    }
+
+    fund_idx, stock_idx, month_idx_list, labels_list = [], [], [], []
+    feat_rows = []
+    fund_names, stock_isins, month_strs = [], [], []
+
+    for r in holds_data:
+        fi = maps['Fund'].get(r['fund'], -1)
+        si = maps['Stock'].get(r['isin'], -1)
+        if fi < 0 or si < 0:
+            continue
+        action = ACTION_MAP.get(str(r.get('action', '')), -1)
+        if action < 0:
+            continue
+
+        month = str(r.get('month', ''))
+        mi = month_to_idx.get(month, -1)
+
+        key = (r['isin'], month)
+        row = df_lookup.get(key)
+        if row is not None:
+            feat = [_safe_float(row.get(c, 0.0)) for c in use_cols]
+        else:
+            feat = [_safe_float(r.get(neo4j_key_map.get(c), 0)) if neo4j_key_map.get(c) else 0.0 for c in use_cols]
+
+        fund_idx.append(fi)
+        stock_idx.append(si)
+        month_idx_list.append(mi)
+        labels_list.append(action)
+        feat_rows.append(feat)
+        fund_names.append(str(r.get('fund', '')))
+        stock_isins.append(str(r.get('isin', '')))
+        month_strs.append(month)
+
+    holds_edge_index = np.array([fund_idx, stock_idx], dtype=np.int64)
+    holds_edge_attr = np.nan_to_num(np.array(feat_rows, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    holds_labels = np.array(labels_list, dtype=np.int64)
+    holds_month_idx = np.array(month_idx_list, dtype=np.int64)
+
+    print(f"  HOLDS processed: {holds_edge_index.shape[1]} edges, {holds_edge_attr.shape[1]} features")
+
+    # -- Train/Val/Test split by month --
+    n_months = len(all_months_sorted)
+    train_cutoff = int(n_months * 0.65)
+    val_cutoff = int(n_months * 0.82)
+    train_mask = holds_month_idx < train_cutoff
+    val_mask = (holds_month_idx >= train_cutoff) & (holds_month_idx < val_cutoff)
+    test_mask = holds_month_idx >= val_cutoff
+    print(f"  Split: train={train_mask.sum()} val={val_mask.sum()} test={test_mask.sum()}")
+    print(f"  Train: {all_months_sorted[0]}→{all_months_sorted[train_cutoff-1]}  "
+          f"Val: {all_months_sorted[train_cutoff]}→{all_months_sorted[val_cutoff-1]}  "
+          f"Test: {all_months_sorted[val_cutoff]}→{all_months_sorted[-1]}")
+
+    return {
+        'node_features': node_features,
+        'edges': edges,
+        'holds_edge_index': holds_edge_index,
+        'holds_edge_attr': holds_edge_attr,
+        'holds_labels': holds_labels,
+        'train_mask': train_mask,
+        'val_mask': val_mask,
+        'test_mask': test_mask,
+        'fund_names': fund_names,
+        'stock_isins': stock_isins,
+        'month_strs': month_strs,
+        'maps': maps,
+    }
 
 
 # ====================================================================
@@ -356,43 +653,55 @@ class CIHGTFundModel(nn.Module):
 # Data loading
 # ====================================================================
 
-def load_hetero_data(export):
-    """Convert pickled export to PyG HeteroData object."""
+def build_hetero_data(kg_data, device):
+    """Convert KG data dict to PyG HeteroData + tensors on device."""
     data = HeteroData()
-    meta = export['metadata']
 
-    # Node features
-    for ntype, feat in export['node_features'].items():
+    for ntype, feat in kg_data['node_features'].items():
         data[ntype].x = torch.tensor(feat, dtype=torch.float)
 
-    # Static edges (non-HOLDS)
-    edges = export['edges']
+    edges = kg_data['edges']
 
     if edges['BELONGS_TO'].shape[1] > 0:
-        data['Stock', 'BELONGS_TO', 'Sector'].edge_index = \
-            torch.tensor(edges['BELONGS_TO'], dtype=torch.long)
+        data['Stock', 'BELONGS_TO', 'Sector'].edge_index = torch.tensor(edges['BELONGS_TO'], dtype=torch.long)
+        # Reverse so Stock gets Sector context and Sector gets Stock context
+        data['Sector', 'rev_BELONGS_TO', 'Stock'].edge_index = torch.tensor(edges['BELONGS_TO'][[1, 0], :], dtype=torch.long)
 
+    causal_edge_attrs = {}
     for ename in ['GRANGER_CAUSES', 'CAUSES', 'CAUSAL_EFFECT']:
         if ename in edges and edges[ename]['index'].shape[1] > 0:
-            data['CausalVariable', ename, 'CausalVariable'].edge_index = \
-                torch.tensor(edges[ename]['index'], dtype=torch.long)
-            data['CausalVariable', ename, 'CausalVariable'].edge_attr = \
-                torch.tensor(edges[ename]['attr'], dtype=torch.float)
+            data['CausalVariable', ename, 'CausalVariable'].edge_index = torch.tensor(edges[ename]['index'], dtype=torch.long)
+            data['CausalVariable', ename, 'CausalVariable'].edge_attr = torch.tensor(edges[ename]['attr'], dtype=torch.float)
+            causal_edge_attrs[ename] = torch.tensor(edges[ename]['attr'], dtype=torch.float).to(device)
 
-    # Add reverse BELONGS_TO (Sector→Stock) so Stock embeddings get sector context
-    if edges['BELONGS_TO'].shape[1] > 0:
-        rev = edges['BELONGS_TO'][[1, 0], :]
-        data['Sector', 'rev_BELONGS_TO', 'Stock'].edge_index = \
-            torch.tensor(rev, dtype=torch.long)
+    data = data.to(device)
 
-    return data
+    # HOLDS tensors (not in HeteroData — used as prediction target)
+    holds_ei = torch.tensor(kg_data['holds_edge_index'], dtype=torch.long).to(device)
+    holds_ea = torch.tensor(kg_data['holds_edge_attr'], dtype=torch.float).to(device)
+    labels   = torch.tensor(kg_data['holds_labels'], dtype=torch.long).to(device)
+    train_mask = torch.tensor(kg_data['train_mask'], dtype=torch.bool).to(device)
+    val_mask   = torch.tensor(kg_data['val_mask'], dtype=torch.bool).to(device)
+    test_mask  = torch.tensor(kg_data['test_mask'], dtype=torch.bool).to(device)
 
+    # Z-normalize HOLDS edge features using train stats
+    ea_mean = holds_ea[train_mask].mean(0, keepdim=True)
+    ea_std  = holds_ea[train_mask].std(0, keepdim=True).clamp(min=1e-6)
+    holds_ea = (holds_ea - ea_mean) / ea_std
+    # Final NaN guard
+    holds_ea = torch.nan_to_num(holds_ea, nan=0.0, posinf=0.0, neginf=0.0)
 
-def build_metadata(data):
-    """Extract (node_types, edge_types) metadata for HGTConv."""
-    node_types = list(data.x_dict.keys())
-    edge_types = list(data.edge_index_dict.keys())
-    return node_types, edge_types
+    in_dims = {ntype: data[ntype].x.shape[1] for ntype in data.node_types}
+    metadata = (data.node_types, list(data.edge_index_dict.keys()))
+    causal_edge_dims = {k: v.shape[1] for k, v in causal_edge_attrs.items()}
+
+    print(f"  HOLDS edge features: {holds_ea.shape[1]}")
+    print(f"  Label distribution: "
+          + " ".join(f"{k}={int((labels==k).sum())}" for k in [0,1,2]))
+
+    return (data, holds_ei, holds_ea, labels,
+            train_mask, val_mask, test_mask,
+            in_dims, metadata, causal_edge_attrs, causal_edge_dims)
 
 
 # ====================================================================
@@ -400,7 +709,7 @@ def build_metadata(data):
 # ====================================================================
 
 def train_epoch(model, data, holds_ei, holds_ea, labels, mask,
-                optimizer, device, batch_size=BATCH_HOLDS):
+                optimizer, device, class_weights=None, batch_size=BATCH_HOLDS):
     model.train()
     total_loss = 0
     indices = mask.nonzero(as_tuple=True)[0]
@@ -411,7 +720,32 @@ def train_epoch(model, data, holds_ei, holds_ea, labels, mask,
         batch_idx = perm[start:start + batch_size]
         optimizer.zero_grad()
         logits = model(data, holds_ei[:, batch_idx], holds_ea[batch_idx])
-        loss = F.cross_entropy(logits, labels[batch_idx])
+        loss = F.cross_entropy(logits, labels[batch_idx], weight=class_weights)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total_loss += float(loss.item()) * len(batch_idx)
+        n_batches += len(batch_idx)
+
+    return total_loss / max(n_batches, 1)
+
+
+def train_epoch_cihgt(model, data, holds_ei, holds_ea, labels, mask,
+                      optimizer, device, edge_attr_dict, class_weights=None,
+                      batch_size=BATCH_HOLDS):
+    """Training step for CI-HGT (passes causal edge attributes)."""
+    model.train()
+    total_loss = 0
+    indices = mask.nonzero(as_tuple=True)[0]
+    perm = indices[torch.randperm(len(indices))]
+
+    n_batches = 0
+    for start in range(0, len(perm), batch_size):
+        batch_idx = perm[start:start + batch_size]
+        optimizer.zero_grad()
+        logits = model(data, holds_ei[:, batch_idx], holds_ea[batch_idx],
+                       edge_attr_dict=edge_attr_dict)
+        loss = F.cross_entropy(logits, labels[batch_idx], weight=class_weights)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -455,64 +789,38 @@ def main():
     print("  Fund Manager KG  ->  position_action prediction")
     print("=" * 70)
 
-    if not os.path.exists(INPUT_PKL):
-        print(f"ERROR: {INPUT_PKL} not found. Run step13b_export_kg_for_gpu.py first.")
-        sys.exit(1)
-
-    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  Device: {device}")
     if device.type == 'cuda':
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    # Load export
-    print(f"\n  Loading {INPUT_PKL}...")
-    with open(INPUT_PKL, 'rb') as f:
-        export = pickle.load(f)
-    meta = export['metadata']
-    print(f"  Nodes: Fund={meta['n_fund']} Stock={meta['n_stock']} "
-          f"Sector={meta['n_sector']} TimePeriod={meta['n_timeperiod']} "
-          f"CausalVar={meta['n_causalvar']}")
-    print(f"  HOLDS: {meta['n_holds']} edges")
-    print(f"  Split: train={meta['n_train']} val={meta['n_val']} test={meta['n_test']}")
+    # Load data directly from Neo4j
+    print("\n  Loading panel data...")
+    df = pd.read_csv(INPUT_FEAT, low_memory=False)
+    print(f"  Panel: {df.shape}")
+    icp_df = pd.read_csv(INPUT_ICP) if os.path.exists(INPUT_ICP) else None
+    dml_df = pd.read_csv(INPUT_DML) if os.path.exists(INPUT_DML) else None
 
-    # Build HeteroData
+    print("\n  Connecting to Neo4j and loading KG...")
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    with driver.session() as s:
+        s.run("RETURN 1").single()
+    print("  Neo4j connected")
+
+    kg_data = load_kg_from_neo4j(driver, df, icp_df, dml_df)
+    driver.close()
+
     print("\n  Building heterogeneous graph...")
-    data = load_hetero_data(export)
-    data = data.to(device)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    (data, holds_ei, holds_ea, labels,
+     train_mask, val_mask, test_mask,
+     in_dims, metadata, causal_edge_attrs, causal_edge_dims) = build_hetero_data(kg_data, device)
 
-    # HOLDS tensors
-    holds = export['holds']
-    holds_ei = torch.tensor(holds['edge_index'], dtype=torch.long).to(device)
-    holds_ea = torch.tensor(holds['edge_attr'],  dtype=torch.float).to(device)
-    labels   = torch.tensor(holds['labels'],     dtype=torch.long).to(device)
-    train_mask = torch.tensor(export['train_mask'], dtype=torch.bool).to(device)
-    val_mask   = torch.tensor(export['val_mask'],   dtype=torch.bool).to(device)
-    test_mask  = torch.tensor(export['test_mask'],  dtype=torch.bool).to(device)
-
-    # Normalize HOLDS edge features
-    ea_mean = holds_ea[train_mask].mean(0, keepdim=True)
-    ea_std  = holds_ea[train_mask].std(0, keepdim=True).clamp(min=1e-6)
-    holds_ea = (holds_ea - ea_mean) / ea_std
-
-    print(f"  HOLDS edge features: {holds_ea.shape[1]}")
-    print(f"  Label distribution: "
-          + " ".join(f"{k}={int((labels==k).sum())}" for k in [0,1,2]))
-
-    # Model
-    in_dims = {ntype: data[ntype].x.shape[1] for ntype in data.node_types}
-    metadata = (data.node_types, list(data.edge_index_dict.keys()))
-
-    # Collect causal edge attributes for CI-HGT
-    causal_edge_attrs = {}
-    edges = export['edges']
-    for ename in ['GRANGER_CAUSES', 'CAUSES', 'CAUSAL_EFFECT']:
-        if ename in edges and edges[ename]['attr'].shape[0] > 0:
-            causal_edge_attrs[ename] = torch.tensor(
-                edges[ename]['attr'], dtype=torch.float).to(device)
-
-    causal_edge_dims = {k: v.shape[1] for k, v in causal_edge_attrs.items()}
+    # Class weights for imbalanced labels
+    label_counts = torch.bincount(labels[train_mask], minlength=3).float()
+    class_weights = (1.0 / label_counts.clamp(min=1)).to(device)
+    class_weights = class_weights / class_weights.sum() * 3
 
     models_to_run = []
     if args.model in ('hgt', 'both'):
@@ -529,15 +837,13 @@ def main():
 
         if model_type == 'standard':
             model = HGTFundModel(
-                metadata=metadata,
-                in_dims=in_dims,
+                metadata=metadata, in_dims=in_dims,
                 edge_feat_dim=holds_ea.shape[1],
             ).to(device)
             output_pt = OUTPUT_PT
         else:
             model = CIHGTFundModel(
-                metadata=metadata,
-                in_dims=in_dims,
+                metadata=metadata, in_dims=in_dims,
                 edge_feat_dim=holds_ea.shape[1],
                 causal_edge_dims=causal_edge_dims,
             ).to(device)
@@ -547,16 +853,10 @@ def main():
         print(f"  Model: {model_name}  hidden={HIDDEN_DIM}  heads={N_HEADS}  "
               f"layers={N_LAYERS}  params={n_params:,}")
 
-        # Class weights for imbalanced labels
-        label_counts = torch.bincount(labels[train_mask], minlength=3).float()
-        class_weights = (1.0 / label_counts.clamp(min=1)).to(device)
-        class_weights = class_weights / class_weights.sum() * 3
-
         optimizer = Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
         scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5,
                                       patience=5, min_lr=1e-5)
 
-        # Training loop
         print(f"  Training {EPOCHS} epochs (patience={PATIENCE})...")
         best_val_f1 = 0.0
         best_epoch = 0
@@ -564,8 +864,16 @@ def main():
 
         for epoch in range(1, EPOCHS + 1):
             t0 = time.time()
-            loss = train_epoch(model, data, holds_ei, holds_ea, labels,
-                               train_mask, optimizer, device)
+
+            if model_type == 'causal':
+                # CI-HGT needs edge_attr_dict for causal gating
+                loss = train_epoch_cihgt(model, data, holds_ei, holds_ea, labels,
+                                         train_mask, optimizer, device,
+                                         causal_edge_attrs, class_weights)
+            else:
+                loss = train_epoch(model, data, holds_ei, holds_ea, labels,
+                                   train_mask, optimizer, device, class_weights)
+
             tr_acc, tr_f1, _, _ = evaluate(model, data, holds_ei, holds_ea,
                                             labels, train_mask, device)
             va_acc, va_f1, _, _ = evaluate(model, data, holds_ei, holds_ea,
@@ -593,7 +901,7 @@ def main():
                 break
 
         # Test evaluation
-        model.load_state_dict(torch.load(output_pt, map_location=device))
+        model.load_state_dict(torch.load(output_pt, map_location=device, weights_only=True))
         te_acc, te_f1, te_preds, te_labels = evaluate(
             model, data, holds_ei, holds_ea, labels, test_mask, device)
 
@@ -606,19 +914,19 @@ def main():
                                      target_names=['SELL', 'HOLD', 'BUY'],
                                      zero_division=0))
 
-        # Save per-decision predictions for downstream (step14b, step16)
+        # Save per-decision predictions
         action_labels = {2: 'BUY', 1: 'HOLD', 0: 'SELL'}
         test_indices = test_mask.nonzero(as_tuple=True)[0].cpu().numpy()
         decision_records = []
-        fund_names = holds.get('fund_names', [])
-        stock_isins = holds.get('stock_isins', [])
-        month_strs = holds.get('month_strs', [])
-        if fund_names and stock_isins and month_strs:
+        fn = kg_data.get('fund_names', [])
+        si = kg_data.get('stock_isins', [])
+        ms = kg_data.get('month_strs', [])
+        if fn and si and ms:
             for i, ti in enumerate(test_indices):
                 decision_records.append({
-                    'Fund_Name': fund_names[ti] if ti < len(fund_names) else '',
-                    'ISIN': stock_isins[ti] if ti < len(stock_isins) else '',
-                    'year_month_str': month_strs[ti] if ti < len(month_strs) else '',
+                    'Fund_Name': fn[ti] if ti < len(fn) else '',
+                    'ISIN': si[ti] if ti < len(si) else '',
+                    'year_month_str': ms[ti] if ti < len(ms) else '',
                     f'{model_name.lower().replace("-","_")}_predicted': int(te_preds[i]),
                     f'{model_name.lower().replace("-","_")}_label': action_labels.get(int(te_preds[i]), ''),
                     'actual': int(te_labels[i]),
@@ -626,18 +934,12 @@ def main():
                 })
             pred_file = os.path.join(DATA_DIR,
                                      f'{model_name.lower().replace("-","_")}_decision_predictions.csv')
-            import pandas as pd
             pd.DataFrame(decision_records).to_csv(pred_file, index=False)
             print(f"  Saved: {pred_file} ({len(decision_records)} decisions)")
-            # Also copy to final/
-            final_dir = os.path.join(SCRIPT_DIR, 'data', 'final')
-            if os.path.exists(final_dir):
+            if os.path.exists(FINAL_DIR):
                 import shutil
                 shutil.copy(pred_file, os.path.join(
-                    final_dir, f'{model_name.lower().replace("-","_")}_decision_predictions.csv'))
-        else:
-            print(f"  NOTE: No fund/stock/month identifiers in export. "
-                  f"Re-run step13b_export_kg_for_gpu.py to enable prediction mapping.")
+                    FINAL_DIR, f'{model_name.lower().replace("-","_")}_decision_predictions.csv'))
 
         all_results[model_name] = {
             'method': f'{model_name} on Fund Manager KG',
@@ -677,40 +979,29 @@ def main():
         print(f"  HGT    F1: {hgt_f1:.4f}")
         print(f"  CI-HGT F1: {ci_f1:.4f}")
         print(f"  Delta:     {delta:+.4f} ({'CI-HGT wins' if delta > 0 else 'HGT wins'})")
-        print(f"\n  CI-HGT novelty: Causal edge strengths modulate message passing")
-        print(f"  via learned CausalGate. Strong causal evidence is amplified,")
-        print(f"  weak evidence is attenuated. The gate LEARNS the threshold.")
         all_results['comparison'] = {
             'hgt_f1': hgt_f1, 'ci_hgt_f1': ci_f1, 'delta': delta
         }
 
-    # Save combined results
-    os.makedirs(DATA_DIR, exist_ok=True)
+    # Save results
     with open(OUTPUT_JSON, 'w') as f:
         json.dump(all_results, f, indent=2)
     print(f"\n  Saved: {OUTPUT_JSON}")
 
-    # Save node embeddings for downstream use (step16c style clustering, etc.)
+    # Save node embeddings
     try:
-        last_model_name = models_to_run[-1][0] if models_to_run else None
-        if last_model_name:
-            model.eval()
-            with torch.no_grad():
-                embeddings = {}
-                for ntype in data.node_types:
-                    if hasattr(data[ntype], 'x'):
-                        embeddings[ntype] = data[ntype].x.cpu().numpy()
-            emb_path = os.path.join(DATA_DIR, 'hgt_embeddings.npz')
-            np.savez(emb_path, **embeddings)
-            print(f"  Saved node embeddings: {emb_path}")
+        model.eval()
+        with torch.no_grad():
+            embeddings = {ntype: data[ntype].x.cpu().numpy() for ntype in data.node_types}
+        emb_path = os.path.join(DATA_DIR, 'hgt_embeddings.npz')
+        np.savez(emb_path, **embeddings)
+        print(f"  Saved node embeddings: {emb_path}")
     except Exception as e:
         print(f"  Warning: could not save embeddings: {e}")
 
-    # Copy to final/
-    final_dir = os.path.join(SCRIPT_DIR, 'data', 'final')
-    if os.path.exists(final_dir):
+    if os.path.exists(FINAL_DIR):
         import shutil
-        dest = os.path.join(final_dir, 'hgt_results.json')
+        dest = os.path.join(FINAL_DIR, 'hgt_results.json')
         shutil.copy(OUTPUT_JSON, dest)
         print(f"  Copied to: {dest}")
 

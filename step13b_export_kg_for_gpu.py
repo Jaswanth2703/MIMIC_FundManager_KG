@@ -176,6 +176,10 @@ def build_node_features(maps, df, icp_df, dml_df):
     feats['CausalVariable'] = cv_feat
     print(f"  CausalVariable features: {cv_feat.shape}")
 
+    # Sanitize all node features: replace NaN/Inf with 0
+    for ntype in feats:
+        feats[ntype] = np.nan_to_num(feats[ntype], nan=0.0, posinf=0.0, neginf=0.0)
+
     return feats, stock_cols
 
 
@@ -292,6 +296,14 @@ def process_holds(holds_data, maps, df):
         'sentiment_mean': 'sentiment',
     }
 
+    def _safe_float(v):
+        """Convert to float, replacing NaN/Inf/None with 0.0."""
+        try:
+            f = float(v) if v is not None else 0.0
+            return f if np.isfinite(f) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     for r in holds_data:
         fi = maps['Fund'].get(r['fund'], -1)
         si = maps['Stock'].get(r['isin'], -1)
@@ -308,13 +320,13 @@ def process_holds(holds_data, maps, df):
         key = (r['isin'], month)
         row = df_lookup.get(key)
         if row is not None:
-            feat = [float(row.get(c, 0.0) or 0.0) for c in use_cols]
+            feat = [_safe_float(row.get(c, 0.0)) for c in use_cols]
         else:
             # Fallback: use what Neo4j returned, same column order & count
             feat = []
             for c in use_cols:
                 nk = neo4j_key_map.get(c)
-                feat.append(float(r.get(nk, 0) or 0) if nk else 0.0)
+                feat.append(_safe_float(r.get(nk, 0)) if nk else 0.0)
 
         fund_idx.append(fi)
         stock_idx.append(si)
