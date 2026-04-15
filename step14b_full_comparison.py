@@ -239,16 +239,26 @@ def main():
         existing = {}
         print("  WARNING: existing comparison not found, M0/M1/M2 will be empty")
 
+    # --- Feature exclusion (prevent leakage) ---
+    EXCLUDE = {'action_ordinal', 'is_buy', 'is_sell',
+               'position_action', 'pct_nav', 'allocation_change',
+               'quantity', 'market_value', 'allocation_momentum',
+               'quantity_change', 'month_gap', 'fund_stock_count',
+               'is_top10', 'allocation_quintile', 'holding_tenure',
+               'real_return', 'target', 'date', 'Date',
+               'year_month_str', 'ISIN', 'Fund_Name', 'Fund_Type',
+               'sector', 'stock_name'}
+
     # --- Define feature sets ---
     all_feats = [c for c in df.select_dtypes(include=[np.number]).columns
-                 if c not in {'action_ordinal', 'is_buy', 'is_sell'}]
+                 if c not in EXCLUDE]
 
     # Granger MB features
     granger_file = os.path.join(CAUSAL_DIR, 'all_causal_links.csv')
     if os.path.exists(granger_file):
         granger_df = pd.read_csv(granger_file)
         granger_feats = sorted(granger_df['cause'].unique().tolist())
-        granger_feats = [f for f in granger_feats if f in df.columns]
+        granger_feats = [f for f in granger_feats if f in df.columns and f not in EXCLUDE]
     else:
         granger_feats = all_feats[:20]
 

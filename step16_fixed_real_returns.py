@@ -159,13 +159,20 @@ def main():
     df = feat_df.merge(real_df, on=['ISIN', 'year_month_str'], how='left')
     print(f"  Merged dataset: {df.shape}")
 
-    # 3. Load M1/M2 feature lists
+    # 3. Feature Exclusion (Prevent Leakage)
+    exclude = {'year_month_str','ISIN','Fund_Name','Fund_Type','sector','stock_name',
+               'position_action','allocation_momentum', 'pct_nav', 'allocation_change', 
+               'quantity', 'market_value', 'real_return', 'target', 'date', 'Date',
+               'quantity_change', 'month_gap', 'fund_stock_count', 'is_top10', 
+               'allocation_quintile', 'holding_tenure'}
+
+    # 4. Load M1/M2 feature lists
     # M1: Granger Markov Blanket features
     granger_path = os.path.join(os.path.dirname(__file__), 'data', 'causal', 'granger_causal_links.csv')
     if os.path.exists(granger_path):
         granger_df_feats = pd.read_csv(granger_path)
         granger_feats = sorted(granger_df_feats['cause'].unique().tolist())
-        granger_feats = [f for f in granger_feats if f in df.columns]
+        granger_feats = [f for f in granger_feats if f in df.columns and f not in exclude]
     else:
         granger_feats = []
         print("  WARNING: granger_causal_links.csv not found, M1 will be empty")
@@ -179,12 +186,6 @@ def main():
         corr_feats = corrs.head(20).index.tolist()
     else:
         corr_feats = []
-    
-    # 4. Feature Exclusion (Prevent Leakage)
-    exclude = {'year_month_str','ISIN','Fund_Name','Fund_Type','sector','stock_name',
-               'position_action','allocation_momentum', 'pct_nav', 'allocation_change', 
-               'quantity', 'market_value', 'real_return', 'target', 'date', 'Date',
-               'quantity_change', 'month_gap', 'fund_stock_count', 'is_top10', 'allocation_quintile'}
     
     feature_sets = {
         'M0_all': [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude],

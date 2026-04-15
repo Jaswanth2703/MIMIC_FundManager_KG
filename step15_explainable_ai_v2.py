@@ -349,6 +349,8 @@ def generate_counterfactual(stock, predicted, top_driver, causal_evidence):
 
     direction = ev.get('dml_direction', '')
     theta = ev.get('dml_theta', ev.get('granger_beta', 0))
+    if theta is None or (isinstance(theta, float) and np.isnan(theta)):
+        theta = 0.0
 
     # Assess counterfactual confidence via DML CI
     ci_lower = ev.get('dml_ci_lower', None)
@@ -448,8 +450,16 @@ def evaluate_quality(explanations, causal_evidence):
 # ============================================================
 # 5. Ollama integration (optional LLM summarization)
 # ============================================================
-def query_ollama(prompt, model='llama3.2:3b', temp=0.3, max_tok=300):
+def query_ollama(prompt, model=None, temp=0.3, max_tok=300):
     try:
+        if model is None:
+            # Auto-detect first available model
+            r = requests.get('http://localhost:11434/api/tags', timeout=5)
+            if r.status_code == 200:
+                models = [m['name'] for m in r.json().get('models', [])]
+                model = models[0] if models else 'llama3.2:3b'
+            else:
+                model = 'llama3.2:3b'
         r = requests.post('http://localhost:11434/api/generate',
                           json={'model': model, 'prompt': prompt, 'stream': False,
                                 'options': {'temperature': temp, 'num_predict': max_tok}},
@@ -460,11 +470,14 @@ def query_ollama(prompt, model='llama3.2:3b', temp=0.3, max_tok=300):
 
 
 def check_ollama():
+    """Check if Ollama is running and has any model available."""
     try:
         r = requests.get('http://localhost:11434/api/tags', timeout=5)
         if r.status_code == 200:
             models = [m['name'] for m in r.json().get('models', [])]
-            return any('llama' in m.lower() for m in models)
+            if models:
+                print(f"  Ollama models found: {', '.join(models[:5])}")
+                return True
     except Exception:
         pass
     return False

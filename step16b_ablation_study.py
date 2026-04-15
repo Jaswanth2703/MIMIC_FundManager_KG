@@ -53,11 +53,16 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import (accuracy_score, f1_score, cohen_kappa_score,
                               classification_report)
 from sklearn.preprocessing import StandardScaler
 from scipy import stats
+
+try:
+    from xgboost import XGBClassifier
+    XGBOOST_OK = True
+except ImportError:
+    XGBOOST_OK = False
 
 warnings.filterwarnings('ignore')
 
@@ -120,7 +125,16 @@ def walk_forward_eval(X, y, months, train_frac=0.65,
                       model_class=None, model_kwargs=None):
     """Walk-forward evaluation returning per-fold metrics."""
     if model_class is None:
-        model_class = GradientBoostingClassifier
+        if XGBOOST_OK:
+            model_class = XGBClassifier
+            if model_kwargs is None:
+                model_kwargs = {'n_estimators': 150, 'max_depth': 5,
+                                'learning_rate': 0.05, 'random_state': 42,
+                                'tree_method': 'hist', 'device': 'cuda',
+                                'verbosity': 0, 'eval_metric': 'mlogloss'}
+        else:
+            from sklearn.ensemble import GradientBoostingClassifier
+            model_class = GradientBoostingClassifier
     if model_kwargs is None:
         model_kwargs = {'n_estimators': 150, 'max_depth': 5,
                         'learning_rate': 0.05, 'random_state': 42}
@@ -464,9 +478,14 @@ def main():
     print(f"  Panel: {df.shape}")
 
     # Identify numeric features
-    exclude_cols = {'Fund_Name', 'ISIN', 'year_month_str', 'date',
+    exclude_cols = {'Fund_Name', 'ISIN', 'year_month_str', 'date', 'Date',
                     'position_action', 'action_ordinal', 'sector',
-                    'stock_name', 'scheme_name'}
+                    'stock_name', 'scheme_name', 'Fund_Type',
+                    'pct_nav', 'allocation_change', 'quantity', 'market_value',
+                    'allocation_momentum', 'quantity_change', 'month_gap',
+                    'fund_stock_count', 'is_top10', 'allocation_quintile',
+                    'holding_tenure', 'real_return', 'target',
+                    'is_buy', 'is_sell'}
     numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns
                     if c not in exclude_cols]
     print(f"  Numeric features: {len(numeric_cols)}")
