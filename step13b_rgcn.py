@@ -130,7 +130,7 @@ class HGTFundModel(nn.Module):
 
         # HGT layers
         self.convs = nn.ModuleList([
-            HGTConv(hidden, hidden, metadata, heads=heads, group='sum')
+            HGTConv(hidden, hidden, metadata, heads=heads)
             for _ in range(n_layers)
         ])
         self.norms = nn.ModuleList([
@@ -157,6 +157,10 @@ class HGTFundModel(nn.Module):
         # HGT message passing
         for conv, norm_dict in zip(self.convs, self.norms):
             h_new = conv(h, edge_index_dict)
+            # Carry forward node types not updated by conv (no incoming edges)
+            for nt in h:
+                if nt not in h_new:
+                    h_new[nt] = h[nt]
             # Residual + norm
             h = {nt: F.dropout(
                      norm_dict[nt](h_new[nt] + h.get(nt, 0)),
@@ -248,7 +252,7 @@ class CIHGTFundModel(nn.Module):
 
         # HGT layers
         self.convs = nn.ModuleList([
-            HGTConv(hidden, hidden, metadata, heads=heads, group='sum')
+            HGTConv(hidden, hidden, metadata, heads=heads)
             for _ in range(n_layers)
         ])
         self.norms = nn.ModuleList([
@@ -289,6 +293,11 @@ class CIHGTFundModel(nn.Module):
 
         for conv, norm_dict in zip(self.convs, self.norms):
             h_new = conv(h, edge_index_dict)
+
+            # Carry forward node types not updated by conv (no incoming edges)
+            for nt in h:
+                if nt not in h_new:
+                    h_new[nt] = h[nt]
 
             # NOVEL: Apply causal gates to CausalVariable embeddings
             if 'CausalVariable' in h_new and edge_attr_dict:
