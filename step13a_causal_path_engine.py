@@ -139,7 +139,7 @@ class DecisionPathExtractor:
             RETURN h.pct_nav AS pct_nav, h.holding_tenure AS tenure,
                    h.position_action AS action, h.allocation_change AS alloc_change,
                    h.rank AS rank, h.consensus AS consensus,
-                   h.monthly_return AS monthly_return,
+                   COALESCE(h.monthly_return, 0) AS monthly_return,
                    s.name AS stock_name, s.sector AS sector
         """, fund=fund_name, month=month, isin=isin)
 

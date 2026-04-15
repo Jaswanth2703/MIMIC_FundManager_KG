@@ -185,8 +185,8 @@ def build_edge_indices(driver, maps):
                h.holding_tenure AS tenure,
                h.allocation_change AS alloc_change,
                h.rsi AS rsi,
-               h.sentiment_mean AS sentiment,
-               h.monthly_return AS m_return,
+               h.sentiment_score AS sentiment,
+               COALESCE(h.monthly_return, 0) AS m_return,
                h.position_action AS action
         ORDER BY h.month
     """)

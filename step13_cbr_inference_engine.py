@@ -129,7 +129,7 @@ class SubgraphExtractor:
         holds = self._run("""
             MATCH (f:Fund {name: $fund})-[h:HOLDS {month: $month}]->(s:Stock {isin: $isin})
             RETURN h.pct_nav AS pct_nav, h.holding_tenure AS tenure,
-                   h.position_action AS action, h.monthly_return AS ret,
+                   h.position_action AS action, COALESCE(h.monthly_return, 0) AS ret,
                    h.rank AS rank, h.consensus AS consensus,
                    s.name AS stock_name, s.sector AS sector
         """, fund=fund_name, month=month, isin=isin)

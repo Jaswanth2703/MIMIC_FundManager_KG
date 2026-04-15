@@ -64,6 +64,9 @@ from neo4j import GraphDatabase
 # ============================================================
 PORTFOLIO_CLEAN_CSV = os.path.join(PORTFOLIO_DIR, 'portfolio_clean.csv')
 EXIT_EVENTS_CSV = os.path.join(PORTFOLIO_DIR, 'exit_events.csv')
+# Use raw (un-standardized) dataset first — LPCMCI_READY is z-scored and may
+# have columns pruned by step08's correlation filter (e.g. monthly_return).
+FEATURES_RAW_CSV = os.path.join(FEATURES_DIR, 'CAUSAL_DISCOVERY_DATASET.csv')
 FEATURES_CSV = os.path.join(FEATURES_DIR, 'LPCMCI_READY.csv')
 FEATURES_FALLBACK = os.path.join(FEATURES_DIR, 'CAUSAL_FEATURES_COMPLETE.csv')
 MACRO_CSV = os.path.join(MACRO_DIR, 'macro_indicators_monthly.csv')
@@ -505,6 +508,7 @@ class TemporalKGBuilder:
             ('rsi', 'rsi'),
             ('beta', 'beta'),
             ('sentiment_score', 'sentiment_score'),
+            ('sentiment_mean', 'sentiment_score'),  # alias: raw CSV uses sentiment_mean
         ]
 
         records = []
@@ -806,16 +810,21 @@ def main():
               "portfolio data or default to UNKNOWN.")
 
     # Optionally enrich with features data
-    features_path = FEATURES_CSV if os.path.exists(FEATURES_CSV) else (
-        FEATURES_FALLBACK if os.path.exists(FEATURES_FALLBACK) else None
-    )
+    # Prefer raw (un-standardized) CAUSAL_DISCOVERY_DATASET.csv — it has the
+    # original monthly_return, sentiment_mean, etc. that step08's correlation
+    # pruning may have removed from LPCMCI_READY.csv.
+    features_path = None
+    for fp in [FEATURES_RAW_CSV, FEATURES_CSV, FEATURES_FALLBACK]:
+        if os.path.exists(fp):
+            features_path = fp
+            break
     if features_path:
         feat_df = pd.read_csv(features_path, low_memory=False)
         print(f"  Features for enrichment: {feat_df.shape}")
         # Merge enrichment columns
         enrich_cols = ['ISIN', 'year_month_str', 'rsi', 'macd', 'beta',
-                       'volatility', 'sentiment_score', 'monthly_return',
-                       'pe', 'pb', 'eps', 'market_cap']
+                       'volatility', 'sentiment_mean', 'sentiment_score',
+                       'monthly_return', 'pe', 'pb', 'eps', 'market_cap']
         enrich_cols = [c for c in enrich_cols if c in feat_df.columns]
         if len(enrich_cols) > 2:
             feat_agg = feat_df[enrich_cols].groupby(
