@@ -156,9 +156,9 @@ class KGExplanationEngine:
         dml = self._run("""
             MATCH (cv:CausalVariable)-[r:CAUSAL_EFFECT]->(t:CausalVariable)
             RETURN cv.name AS treatment, t.name AS outcome,
-                   r.theta AS theta, r.ci_lower AS ci_lower,
-                   r.ci_upper AS ci_upper, r.significant AS sig
-            ORDER BY abs(r.theta) DESC LIMIT 5
+                   r.theta_hat AS theta, r.ci_lower_95 AS ci_lower,
+                   r.ci_upper_95 AS ci_upper, r.significant AS sig
+            ORDER BY abs(r.theta_hat) DESC LIMIT 5
         """)
         ctx['dml_effects'] = dml
 
@@ -219,8 +219,11 @@ class KGExplanationEngine:
                          f"{p.get('child','?')}")
         for d in ctx.get('dml_effects', [])[:3]:
             sig = '*' if d.get('sig') else ''
-            lines.append(f"   - {d['treatment']} -[CAUSAL_EFFECT, theta={d.get('theta',0):+.4f}{sig} "
-                         f"CI=[{d.get('ci_lower',0):+.4f}, {d.get('ci_upper',0):+.4f}]]-> "
+            theta = d.get('theta') or 0
+            ci_lo = d.get('ci_lower') or 0
+            ci_hi = d.get('ci_upper') or 0
+            lines.append(f"   - {d['treatment']} -[CAUSAL_EFFECT, theta={theta:+.4f}{sig} "
+                         f"CI=[{ci_lo:+.4f}, {ci_hi:+.4f}]]-> "
                          f"{d.get('outcome','?')}")
         lines.append("")
 

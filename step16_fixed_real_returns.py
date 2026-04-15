@@ -109,8 +109,12 @@ def compute_metrics(fold_results):
     
     # Sortino ratio (penalizes downside volatility only)
     downside = excess[excess < 0]
-    downside_std = np.std(downside) if len(downside) > 0 else np.std(excess)
-    sortino = (np.mean(excess) / downside_std) * np.sqrt(12) if downside_std > 0 else 0
+    if len(downside) > 1:
+        downside_std = np.std(downside)
+        sortino = (np.mean(excess) / downside_std) * np.sqrt(12) if downside_std > 0 else 0
+    else:
+        # No losing months → extremely low downside risk
+        sortino = (np.mean(excess) / np.std(excess)) * np.sqrt(12) * 2 if np.std(excess) > 0 else 0
 
     # Information ratio (vs benchmark)
     active_returns = returns - bench_returns
@@ -155,14 +159,26 @@ def main():
     df = feat_df.merge(real_df, on=['ISIN', 'year_month_str'], how='left')
     print(f"  Merged dataset: {df.shape}")
 
-    # 3. Load MB Features
-    mb_path = os.path.join(FINAL_DIR, 'markov_blanket_features.json')
-    if os.path.exists(mb_path):
-        with open(mb_path) as f:
-            mb_data = json.load(f)
+    # 3. Load M1/M2 feature lists
+    # M1: Granger Markov Blanket features
+    granger_path = os.path.join(os.path.dirname(__file__), 'data', 'causal', 'granger_causal_links.csv')
+    if os.path.exists(granger_path):
+        granger_df_feats = pd.read_csv(granger_path)
+        granger_feats = sorted(granger_df_feats['cause'].unique().tolist())
+        granger_feats = [f for f in granger_feats if f in df.columns]
     else:
-        mb_data = {'mb_columns': [], 'correlation_columns': []}
-        print("  WARNING: markov_blanket_features.json not found, using M0 only")
+        granger_feats = []
+        print("  WARNING: granger_causal_links.csv not found, M1 will be empty")
+
+    # M2: Correlation top-K features
+    if 'position_action' in df.columns:
+        tmp = df.copy()
+        tmp['_target'] = tmp['position_action'].map(ACTION_MAP)
+        num_feats = [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude]
+        corrs = tmp[num_feats].corrwith(tmp['_target']).abs().sort_values(ascending=False)
+        corr_feats = corrs.head(20).index.tolist()
+    else:
+        corr_feats = []
     
     # 4. Feature Exclusion (Prevent Leakage)
     exclude = {'year_month_str','ISIN','Fund_Name','Fund_Type','sector','stock_name',
@@ -172,8 +188,8 @@ def main():
     
     feature_sets = {
         'M0_all': [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude],
-        'M1_causal_MB': [c for c in mb_data['mb_columns'] if c in df.columns],
-        'M2_correlation': [c for c in mb_data['correlation_columns'] if c in df.columns]
+        'M1_causal_MB': granger_feats,
+        'M2_correlation': corr_feats,
     }
 
     all_months = sorted(df['year_month_str'].dropna().unique())
