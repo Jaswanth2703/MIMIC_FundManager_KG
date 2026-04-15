@@ -377,25 +377,22 @@ def model_ablation(df, features):
     models = {
         'LogisticRegression': (LogisticRegression,
                                {'max_iter': 1000, 'random_state': 42,
-                                'multi_class': 'multinomial'}),
+                                'solver': 'lbfgs'}),
         'RandomForest': (RandomForestClassifier,
                          {'n_estimators': 200, 'max_depth': 10,
                           'random_state': 42, 'n_jobs': -1}),
-        'GBM': (GradientBoostingClassifier,
-                {'n_estimators': 200, 'max_depth': 5,
-                 'learning_rate': 0.05, 'random_state': 42}),
-    }
-
-    # Try XGBoost if available
-    try:
-        from xgboost import XGBClassifier
-        models['XGBoost'] = (XGBClassifier,
-                             {'n_estimators': 200, 'max_depth': 5,
-                              'learning_rate': 0.05, 'random_state': 42,
-                              'use_label_encoder': False, 'eval_metric': 'mlogloss',
-                              'tree_method': 'hist'})
-    except ImportError:
-        pass
+    # Use XGBoost instead of sklearn GBM (much faster with GPU)
+    if XGBOOST_OK:
+        models['XGBoost_GPU'] = (XGBClassifier,
+                                 {'n_estimators': 200, 'max_depth': 5,
+                                  'learning_rate': 0.05, 'random_state': 42,
+                                  'eval_metric': 'mlogloss',
+                                  'tree_method': 'hist', 'device': 'cuda',
+                                  'verbosity': 0})
+    else:
+        models['GBM'] = (GradientBoostingClassifier,
+                         {'n_estimators': 200, 'max_depth': 5,
+                          'learning_rate': 0.05, 'random_state': 42})
 
     # Try LightGBM if available
     try:
@@ -495,6 +492,8 @@ def main():
     for g, cols in feature_groups.items():
         if cols:
             print(f"    {g}: {len(cols)} features")
+            if g == 'other':
+                print(f"      (contents: {cols[:15]}{'...' if len(cols)>15 else ''})")
 
     all_results = {}
 
