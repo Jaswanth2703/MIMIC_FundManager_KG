@@ -973,7 +973,7 @@ def diagram_phase2_comparison():
     ax.axis('off')
     fig.patch.set_facecolor('white')
 
-    ax.text(0.5, 0.94, 'Phase 2: 7-Way Model Comparison (Mimicry Metrics)',
+    ax.text(0.5, 0.94, 'Phase 2: 9-Model Comparison (Mimicry Metrics)',
             ha='center', va='center', fontsize=16, fontweight='bold',
             fontfamily=FONT, color=C['text'], transform=ax.transAxes)
     ax.text(0.5, 0.88, 'All models evaluated on same test months — walk-forward cross-validation',
@@ -993,7 +993,9 @@ def diagram_phase2_comparison():
         ['M7: CI-HGT (Novel)',        '✓ Direct', '0.485', '0.500', '0.234', '0.485', '0.519', '0.609'],
     ]
 
+    col_widths = [0.28, 0.08, 0.09, 0.09, 0.10, 0.10, 0.13, 0.13]
     table = ax.table(cellText=data[1:], colLabels=data[0],
+                     colWidths=col_widths,
                      cellLoc='center', loc='center',
                      bbox=[0.02, 0.08, 0.96, 0.75])
     table.auto_set_font_size(False)
@@ -1051,10 +1053,12 @@ def diagram_backtest_table():
         ['M5: PathTransformer', '-0.22', '-0.43', '0.94',  '-1.3%',  '-15.2%', '-0.08', '50%'],
         ['M6: HGT',             '1.52',  '2.36',  '4.17',  '37.9%',  '-0.8%',  '50.16', '46%'],
         ['M7: CI-HGT (Novel)',  '1.50',  '2.32',  '4.08',  '37.1%',  '-0.8%',  '49.18', '46%'],
-        ['M8: KG Ensemble',     '2.45',  '4.91',  '5.87',  '70.9%',  '0.0%',   '∞',     '56%'],
+        ['M8: KG Ensemble',     '2.45',  '4.91',  '5.87',  '70.9%',  '~0.0%',  '>999',  '56%'],
     ]
 
+    col_widths = [0.22, 0.09, 0.09, 0.11, 0.12, 0.10, 0.10, 0.10]
     table = ax.table(cellText=data[1:], colLabels=data[0],
+                     colWidths=col_widths,
                      cellLoc='center', loc='center',
                      bbox=[0.02, 0.08, 0.96, 0.72])
     table.auto_set_font_size(False)
@@ -1072,9 +1076,12 @@ def diagram_backtest_table():
             cell.set_facecolor('#F5F5F5')
         else:
             cell.set_facecolor('white')
+        if col == 0:
+            cell.set_text_props(ha='left')
+            cell._loc = 'left'
 
     ax.text(0.5, 0.03,
-            'M1 shows 0.00: MB/Granger file path was wrong (fixed in v7)  |  '
+            'M8 Calmar >999: negligible drawdown (~0%)  |  '
             'Sharpe (Sharpe, 1966)  |  '
             'Sortino (Sortino & van der Meer, 1991)  |  '
             'IR (Grinold & Kahn, 2000)',
@@ -1299,7 +1306,10 @@ def diagram_competency_questions():
         ['Q10', 'How many total causal + temporal edges exist?', '✓', '144,469'],
     ]
 
+    # # col narrow, Question col wide, Answered? and Result moderate
+    col_widths = [0.04, 0.58, 0.10, 0.24]
     table = ax.table(cellText=data[1:], colLabels=data[0],
+                     colWidths=col_widths,
                      cellLoc='center', loc='center',
                      bbox=[0.02, 0.05, 0.96, 0.80])
     table.auto_set_font_size(False)
