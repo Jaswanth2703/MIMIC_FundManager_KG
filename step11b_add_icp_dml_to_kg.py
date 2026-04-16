@@ -51,11 +51,12 @@ def ensure_target_nodes(session):
 
 
 def merge_icp_edges(session, df):
-    """Insert :CAUSES edges from ICP v5 results.
+    """Insert :CAUSES edges from ICP v7.2 results.
 
-    Each edge points to the correct target (action_ordinal, is_buy, is_sell).
-    ICP has 'target' column from v5.
-    Also adds an edge to 'position_action' for backward compatibility.
+    v7.2: Now includes soft confidence for ALL candidates, not just certified.
+    confidence_type: 'certified' (in plausible intersection), 'plausible' (in some sets),
+                     'soft' (best_p/alpha fallback when zero plausible sets).
+    CI-HGT CausalGate uses confidence values — more edges = more signal.
     """
     print(f"\n  Merging {len(df)} ICP rows ...")
 
@@ -65,11 +66,13 @@ def merge_icp_edges(session, df):
     rows = []
     for _, r in df.iterrows():
         target = r[target_col] if target_col else 'position_action'
+        conf_type = str(r.get('confidence_type', 'unknown'))
         rows.append({
             'variable':            str(r['variable']),
             'target':              str(target),
             'stratum':             str(r['stratum']),
             'confidence':          float(r['confidence']),
+            'confidence_type':     conf_type,
             'in_intersection':     bool(r['in_intersection']),
             'plausible_sets_total':int(r['plausible_sets_total']),
             'n_obs':               int(r['n_obs']),
@@ -83,6 +86,7 @@ def merge_icp_edges(session, df):
     MERGE (c)-[r:CAUSES {stratum: row.stratum, target: row.target}]->(t)
     SET r.method             = 'ICP',
         r.confidence         = row.confidence,
+        r.confidence_type    = row.confidence_type,
         r.in_intersection    = row.in_intersection,
         r.plausible_sets     = row.plausible_sets_total,
         r.n_obs              = row.n_obs,
@@ -91,7 +95,8 @@ def merge_icp_edges(session, df):
     session.run(cypher, rows=rows)
 
     certified = [r for r in rows if r['in_intersection']]
-    print(f"  ICP edges merged: {len(rows)} total, {len(certified)} certified")
+    soft = [r for r in rows if r['confidence_type'] == 'soft']
+    print(f"  ICP edges merged: {len(rows)} total, {len(certified)} certified, {len(soft)} soft-confidence")
 
 
 def merge_dml_edges(session, df):

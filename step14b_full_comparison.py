@@ -282,7 +282,9 @@ def main():
     else:
         corr_feats = all_feats[:20]
 
-    # M3: ICP causal parents (v7: lowered threshold since ICP now finds more)
+    # M3: ICP causal parents (v7.2: includes soft confidence from best_p/alpha fallback)
+    # With soft confidence, variables that almost passed ICP invariance are included,
+    # giving CI-HGT more causal signal and M3 more features for XGBoost.
     if os.path.exists(INPUT_ICP):
         icp = pd.read_csv(INPUT_ICP)
         icp_feats = sorted(icp[icp['confidence'] >= 0.3]['variable'].unique())

@@ -261,7 +261,8 @@ def load_kg_from_neo4j(driver, df, icp_df, dml_df):
         ('CAUSES', """
             MATCH (c:CausalVariable)-[r:CAUSES]->(t:CausalVariable)
             RETURN c.name AS src, t.name AS dst,
-                   r.confidence AS conf, r.in_intersection AS cert"""),
+                   r.confidence AS conf, r.in_intersection AS cert,
+                   r.confidence_type AS conf_type"""),
         ('CAUSAL_EFFECT', """
             MATCH (c:CausalVariable)-[r:CAUSAL_EFFECT]->(t:CausalVariable)
             WHERE r.significant = true
@@ -278,15 +279,19 @@ def load_kg_from_neo4j(driver, df, icp_df, dml_df):
                       _safe_float(data_rows[i].get('lag')),
                       1.0 - _safe_float(data_rows[i].get('pval'))] for i in valid]
         elif ename == 'CAUSES':
+            # v7.2: 3 features — [confidence, certified_flag, type_weight]
+            # type_weight: certified=1.0, plausible=0.7, soft=0.4
+            _type_w = {'certified': 1.0, 'plausible': 0.7, 'soft': 0.4}
             attr = [[_safe_float(data_rows[i].get('conf')),
-                      1.0 if data_rows[i].get('cert') else 0.0] for i in valid]
+                      1.0 if data_rows[i].get('cert') else 0.0,
+                      _type_w.get(str(data_rows[i].get('conf_type', 'soft')), 0.4)] for i in valid]
         else:
             attr = [[_safe_float(data_rows[i].get('theta')),
                       1.0 if data_rows[i].get('cert') else 0.0] for i in valid]
 
         edges[ename] = {
             'index': np.array([[src_idx[i], dst_idx[i]] for i in valid], dtype=np.int64).T if valid else np.zeros((2,0), dtype=np.int64),
-            'attr':  np.array(attr, dtype=np.float32) if valid else np.zeros((0, 3 if ename == 'GRANGER_CAUSES' else 2), dtype=np.float32),
+            'attr':  np.array(attr, dtype=np.float32) if valid else np.zeros((0, 3), dtype=np.float32),
         }
         print(f"  {ename}: {len(valid)} edges")
 

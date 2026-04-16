@@ -338,14 +338,18 @@ def fit_and_residuals(X, y):
 
 
 def run_icp_exhaustive(df, env_labels, target_col, candidates, alpha=None):
-    """Run ICP with soft intersection.
+    """Run ICP with soft intersection + fallback confidence.
 
-    v7.1: Added progress printing + reduced subset size for speed.
+    v7.2: When zero plausible sets pass, compute soft confidence from
+    best invariance p-value per variable (max_p / alpha, capped at 1.0).
+    This gives CI-HGT causal signal even for hard targets.
     """
     if alpha is None:
         alpha = ALPHA_PRIMARY
     y     = df[target_col].astype(float).values
     sets  = []
+    # Track best (highest) p-value per variable across ALL subsets
+    best_p_per_var = defaultdict(float)
     n_sub = sum(len(list(combinations(candidates, k)))
                 for k in range(1, MAX_SUBSET_SIZE+1))
     print(f"  Testing {n_sub} subsets (alpha={alpha}) ...", end=' ', flush=True)
@@ -361,6 +365,9 @@ def run_icp_exhaustive(df, env_labels, target_col, candidates, alpha=None):
                 continue
             resid = fit_and_residuals(X, y)
             p    = test_invariance(pd.Series(resid, index=env_labels.index), env_labels)
+            # Track best p-value for each variable in this subset
+            for v in subset:
+                best_p_per_var[v] = max(best_p_per_var[v], p)
             if p > alpha:
                 sets.append(set(subset))
 
@@ -381,11 +388,34 @@ def run_icp_exhaustive(df, env_labels, target_col, candidates, alpha=None):
         if extra:
             print(f"  Soft intersection found {len(extra)} additional parents: {sorted(extra)}")
 
+    # v7.2: Compute confidence for ALL candidates
+    # If plausible sets exist: confidence = freq / total (standard ICP)
+    # If zero plausible sets: confidence = best_p / alpha (soft fallback)
+    #   - p close to alpha → confidence near 1.0 (almost passed)
+    #   - p near 0 → confidence near 0 (far from passing)
+    if sets:
+        var_confidence = {v: c / total for v, c in freq.items()}
+    else:
+        var_confidence = {}
+
+    # Add soft confidence for variables NOT in any plausible set
+    for v, p in best_p_per_var.items():
+        if v not in var_confidence:
+            soft_conf = min(p / alpha, 0.99)  # cap below 1.0 to distinguish from certified
+            var_confidence[v] = round(soft_conf, 4)
+
+    if not sets and best_p_per_var:
+        top_soft = sorted(best_p_per_var.items(), key=lambda x: -x[1])[:5]
+        print(f"  Soft confidence (best_p/alpha) for top candidates:")
+        for v, p in top_soft:
+            print(f"    {v:<35}  best_p={p:.4f}  soft_conf={min(p/alpha, 0.99):.3f}")
+
     return {
         'causal_parents':        sorted(causal_soft),
         'causal_parents_strict': sorted(causal_strict),
         'plausible_set_count':   len(sets),
-        'variable_confidence':   {v: c/total for v, c in freq.items()},
+        'variable_confidence':   var_confidence,
+        'best_p_per_var':        dict(best_p_per_var),
         'tested_subsets':        n_sub,
         'alpha':                 alpha,
     }
@@ -490,13 +520,17 @@ def main():
     for key, res in all_results.items():
         if res is None: continue
         for var, conf in res['variable_confidence'].items():
+            is_certified = var in res['causal_parents']
+            has_plausible = res['plausible_set_count'] > 0
             rows.append({
                 'stratum':              res['stratum'],
                 'target':               res['target'],
                 'variable':             var,
                 'confidence':           conf,
-                'in_intersection':      var in res['causal_parents'],
+                'confidence_type':      'certified' if is_certified else ('plausible' if has_plausible else 'soft'),
+                'in_intersection':      is_certified,
                 'plausible_sets_total': res['plausible_set_count'],
+                'best_p_value':         res.get('best_p_per_var', {}).get(var, None),
                 'n_obs':                res['n_obs'],
                 'n_environments':       res['n_environments'],
                 'n_candidates':         res['n_candidates'],
