@@ -11,7 +11,7 @@ import json, traceback, warnings
 import numpy as np, pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import FEATURES_DIR, FINAL_DIR
+from config import FEATURES_DIR, FINAL_DIR, CAUSAL_DIR
 
 warnings.filterwarnings('ignore')
 
@@ -168,10 +168,9 @@ def main():
 
     # 4. Load M1/M2 feature lists
     # M1: Markov Blanket features (v7: from step09a Grow-Shrink)
-    mb_path = os.path.join(os.path.dirname(__file__), 'data', 'causal', 'markov_blanket.json')
-    granger_path = os.path.join(os.path.dirname(__file__), 'data', 'causal', 'granger_causal_links.csv')
+    mb_path = os.path.join(CAUSAL_DIR, 'markov_blanket.json')
+    granger_path = os.path.join(CAUSAL_DIR, 'all_causal_links.csv')
     if os.path.exists(mb_path):
-        import json
         with open(mb_path) as f:
             mb_data = json.load(f)
         mb_feats = set()

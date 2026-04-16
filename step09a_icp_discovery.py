@@ -47,11 +47,11 @@ ACTION_MAP = {
 # ---- IMPROVED SETTINGS (v7) ----
 ALPHA_SWEEP           = [0.05, 0.10, 0.15, 0.20]
 ALPHA_PRIMARY         = 0.10
-MAX_SUBSET_SIZE       = 4
-CANDIDATES_PER_PASS   = 25      # v7: up from 20
-MAX_CANDIDATES_FINAL  = 50      # v7: up from 25
-SOFT_INTERSECTION_PCT = 0.80    # v7: relaxed from 0.90
-MIN_PER_ENV           = 150     # v7: reduced from 200
+MAX_SUBSET_SIZE       = 3       # v7.1: was 4 → C(30,3)=4060 vs C(50,4)=230K
+CANDIDATES_PER_PASS   = 25
+MAX_CANDIDATES_FINAL  = 30      # v7.1: was 50 → prevents combinatorial explosion
+SOFT_INTERSECTION_PCT = 0.80
+MIN_PER_ENV           = 150
 
 EXCLUDE = {
     'action_ordinal', 'is_buy', 'is_sell',
@@ -340,9 +340,7 @@ def fit_and_residuals(X, y):
 def run_icp_exhaustive(df, env_labels, target_col, candidates, alpha=None):
     """Run ICP with soft intersection.
 
-    v6: Instead of strict set.intersection (requires ALL plausible sets),
-    uses soft intersection: variables appearing in >=SOFT_INTERSECTION_PCT
-    of plausible sets are certified. Also runs multi-alpha sensitivity.
+    v7.1: Added progress printing + reduced subset size for speed.
     """
     if alpha is None:
         alpha = ALPHA_PRIMARY
@@ -350,12 +348,15 @@ def run_icp_exhaustive(df, env_labels, target_col, candidates, alpha=None):
     sets  = []
     n_sub = sum(len(list(combinations(candidates, k)))
                 for k in range(1, MAX_SUBSET_SIZE+1))
-    print(f"  Testing {n_sub} subsets (alpha={alpha}) ...")
+    print(f"  Testing {n_sub} subsets (alpha={alpha}) ...", end=' ', flush=True)
 
+    tested = 0
     for k in range(1, MAX_SUBSET_SIZE+1):
         for subset in combinations(candidates, k):
+            tested += 1
+            if tested % 1000 == 0:
+                print(f"{tested}/{n_sub}", end=' ', flush=True)
             X    = df[list(subset)].fillna(df[list(subset)].median()).values
-            # Check rank before fitting
             if np.linalg.matrix_rank(X) < X.shape[1]:
                 continue
             resid = fit_and_residuals(X, y)
@@ -363,7 +364,7 @@ def run_icp_exhaustive(df, env_labels, target_col, candidates, alpha=None):
             if p > alpha:
                 sets.append(set(subset))
 
-    print(f"  Plausible sets: {len(sets)}")
+    print(f"\n  Plausible sets: {len(sets)}")
 
     # v6: Soft intersection — variables in >=90% of plausible sets
     freq = defaultdict(int)
