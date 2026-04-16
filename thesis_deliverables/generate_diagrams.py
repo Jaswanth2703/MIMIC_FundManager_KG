@@ -284,8 +284,8 @@ def diagram_kg_schema():
 
     # Relationships: (from_node, to_node, label, count, color, rad)
     rels = [
-        ('Fund', 'Stock',          'HOLDS\n83,643',     C['fund'],    0.0),
-        ('Fund', 'Stock',          'EXITED\n4,567',     C['highlight'], -0.25),
+        ('Fund', 'Stock',          'HOLDS\n83,643',     C['fund'],    0.15),
+        ('Fund', 'Stock',          'EXITED\n4,567',     C['highlight'], -0.15),
         ('Stock', 'Sector',        'BELONGS_TO\n1,057', C['stock'],   0.0),
         ('TimePeriod','TimePeriod', 'NEXT\n45',          C['time'],    0.4),
         ('TimePeriod','MarketRegime','IN_REGIME\n46',    C['regime'],  0.0),
@@ -293,9 +293,9 @@ def diagram_kg_schema():
         ('FundSnapshot','TimePeriod','ACTIVE_IN\n1,076', C['snapshot'],0.15),
         ('Stock','StockSnapshot',  'OF_STOCK\n25,538',  C['stock'],   0.15),
         ('StockSnapshot','TimePeriod','AT_TIME\n26,614', C['snapshot'],0.15),
-        ('CausalVariable','CausalVariable','GRANGER_CAUSES\n106', C['causal'], 0.35),
+        ('CausalVariable','CausalVariable','GRANGER_CAUSES\n106', C['causal'], 0.5),
         ('CausalVariable','DomainConcept','REPRESENTS\n12', C['causal'], 0.0),
-        ('DomainConcept','DomainConcept','INFLUENCES\n7', C['domain'], 0.4),
+        ('DomainConcept','DomainConcept','INFLUENCES\n7', C['domain'], 0.5),
         ('CausalVariable','CausalAnalysis','ASSOCIATED_WITH\n27', C['causal'], 0.0),
     ]
 
@@ -320,8 +320,8 @@ def diagram_kg_schema():
             mx, my = (x1+x2)/2, (y1+y2)/2
             # Offset label for curved arrows
             if abs(rad) > 0.1:
-                mx += rad * 1.2
-                my += abs(rad) * 0.3
+                mx += rad * 2.0
+                my += abs(rad) * 0.5
             parts = label.split('\n')
             ax.text(mx, my + 0.15, parts[0], ha='center', va='center',
                     fontsize=7, fontweight='bold', color=color, fontfamily=FONT,
@@ -377,13 +377,13 @@ def diagram_causal_discovery():
         (9.0, 6.0, 'Invariant Causal\nPrediction (ICP)',
          'Step 09a',
          ['Tests invariance across',
-          '  environments (Fund_Type,',
-          '  regime, VIX level)',
-          'Confidence ∈ [0, 1]'],
-         ['confidence (causal strength)',
-          'in_intersection (boolean)',
-          'plausible_sets per var',
-          '1 confirmed variable'],
+          '  rich environments (quarter',
+          '  × regime × temporal)',
+          'Soft intersection (≥80%)'],
+         ['confidence ∈ [0, 1]',
+          'Markov Blanket discovery',
+          'Multi-alpha sensitivity',
+          '5 parents (is_sell)'],
          C['novel'],
          'CAUSES'),
 
@@ -454,10 +454,11 @@ def diagram_causal_discovery():
     ax.text(9, 0.5, 'Unified causal layer: 133 causal edges from 3 complementary methods',
             ha='center', va='center', fontsize=8, color=C['text_light'], fontfamily=FONT)
 
-    for x in [3.0, 9.0, 15.0]:
+    conv_rads = [0.3, 0.0, -0.3]
+    for x, rad in zip([3.0, 9.0, 15.0], conv_rads):
         ax.annotate('', xy=(9, 1.2), xytext=(x, 2.8),
                     arrowprops=dict(arrowstyle='->', color=C['phase1_kg'],
-                                    lw=1.5, connectionstyle='arc3,rad=0'))
+                                    lw=1.5, connectionstyle=f'arc3,rad={rad}'))
 
     _save(fig, '03_causal_discovery_framework.png')
 
@@ -570,13 +571,16 @@ def diagram_phase2_architecture():
         ax.text(x, y - 0.4, desc, ha='center', va='center',
                 fontsize=7.5, color=C['text'], fontfamily=FONT, style='italic')
 
-    # Arrows from models to downstream
-    for mx in [3.5, 10.0, 16.5]:
+    # Arrows from models to downstream (curved to reduce overlap)
+    model_xs = [3.5, 10.0, 16.5]
+    model_rads = [-0.15, 0.0, 0.15]
+    for mx, rad in zip(model_xs, model_rads):
         for dx in [3.5, 8.0, 12.5, 17.0]:
             ax.annotate('', xy=(dx, 3.1),
                         xytext=(mx, 5.0),
                         arrowprops=dict(arrowstyle='->', color=C['border'],
-                                        lw=0.6, alpha=0.4))
+                                        lw=0.6, alpha=0.4,
+                                        connectionstyle=f'arc3,rad={rad}'))
 
     # Data flow label
     ax.text(10, 4.2, 'Per-Decision Predictions Flow',
@@ -869,9 +873,9 @@ def diagram_results_table():
     t2_data = [
         ['Method', 'Edges', 'Key Output', 'Significance'],
         ['Panel Granger', '106', 'β, p_fdr, partial_r²', '100% FDR significant'],
-        ['ICP', '1 confirmed', 'confidence ∈ [0,1]', 'volume_ratio confirmed'],
-        ['DML', '27 effects', 'θ̂, 95% CI', 'Debiased estimates'],
-        ['Total Causal', '133', '3 complementary layers', 'Multi-method validated'],
+        ['ICP (v7)', '32 parents', 'confidence, MB(Y)', '5 parents (is_sell)'],
+        ['DML', '117 effects', 'θ̂, 95% CI', '98 significant (35 vars)'],
+        ['Total Causal', '282', '3 complementary layers', 'Multi-method validated'],
     ]
 
     t2 = ax.table(cellText=t2_data[1:], colLabels=t2_data[0],
@@ -978,15 +982,15 @@ def diagram_phase2_comparison():
 
     data = [
         ['Model', 'KG?', 'Accuracy', 'F1 (Wt)', 'κ (Kappa)', 'Agreement', 'BUY Recall', 'SELL Recall'],
-        ['M0: XGBoost (All Features)', 'No', '—', '—', '—', '—', '—', '—'],
-        ['M1: XGBoost (Causal MB)', 'Indirect', '—', '—', '—', '—', '—', '—'],
-        ['M2: XGBoost (Correlation)', 'No', '—', '—', '—', '—', '—', '—'],
-        ['M3: Naïve HOLD Baseline', 'No', '—', '—', '—', '—', '—', '—'],
-        ['M4: CBR-KG (WL Kernel)', '✓ Direct', '—', '—', '—', '—', '—', '—'],
-        ['M5: Path Transformer', '✓ Direct', '—', '—', '—', '—', '—', '—'],
-        ['M6: HGT', '✓ Direct', '—', '—', '—', '—', '—', '—'],
-        ['M7: CI-HGT (Novel)', '✓ Direct', '—', '—', '—', '—', '—', '—'],
-        ['M8: KG Ensemble', '✓ Direct', '—', '—', '—', '—', '—', '—'],
+        ['M_naive: HOLD Baseline',     'No',       '0.494', '0.326', '0.000', '0.494', '0.000', '0.000'],
+        ['M0: XGBoost (All Features)', 'No',       '0.798', '0.787', '0.646', '0.798', '0.625', '0.565'],
+        ['M1: XGBoost (Causal MB)',    'Indirect', '0.619', '0.601', '0.321', '0.619', '0.421', '0.344'],
+        ['M2: XGBoost (Correlation)',  'No',       '0.740', '0.719', '0.537', '0.740', '0.433', '0.580'],
+        ['M3: ICP Causal',            'Indirect', '0.528', '0.423', '0.046', '0.528', '0.121', '0.014'],
+        ['M4: CBR-KG (WL Kernel)',    '✓ Direct', '0.558', '0.522', '0.192', '0.558', '0.371', '0.112'],
+        ['M5: Path Transformer',      '✓ Direct', '0.562', '0.552', '0.203', '0.562', '0.138', '0.504'],
+        ['M6: HGT',                   '✓ Direct', '0.486', '0.503', '0.233', '0.486', '0.480', '0.627'],
+        ['M7: CI-HGT (Novel)',        '✓ Direct', '0.485', '0.500', '0.234', '0.485', '0.519', '0.609'],
     ]
 
     table = ax.table(cellText=data[1:], colLabels=data[0],
@@ -1001,7 +1005,7 @@ def diagram_phase2_comparison():
         if row == 0:
             cell.set_facecolor(C['phase2_model'])
             cell.set_text_props(color='white', fontweight='bold', fontsize=9.5)
-        elif row in [5, 6, 7, 8, 9]:
+        elif row in [6, 7, 8, 9]:
             cell.set_facecolor('#E8F5E9')  # Green tint for KG models
         elif row % 2 == 0:
             cell.set_facecolor('#F5F5F5')
@@ -1012,9 +1016,9 @@ def diagram_phase2_comparison():
             cell._loc = 'left'
 
     ax.text(0.5, 0.03,
-            '— = Fill after running Phase 2 on personal PC  |  '
             'κ = Cohen\'s Kappa (Cohen, 1960)  |  '
-            'F1 Wt = Weighted F1 Score',
+            'F1 Wt = Weighted F1 Score  |  '
+            'Walk-forward CV across 46 monthly test folds',
             ha='center', va='center', fontsize=8.5, fontfamily=FONT,
             color=C['text_light'], transform=ax.transAxes, style='italic')
 
@@ -1040,14 +1044,14 @@ def diagram_backtest_table():
 
     data = [
         ['Strategy', 'Sharpe', 'Sortino', 'Info Ratio', 'Ann. Return', 'Max DD', 'Calmar', 'Turnover'],
-        ['M0: XGBoost All', '—', '—', '—', '—', '—', '—', '—'],
-        ['M1: XGBoost Causal', '—', '—', '—', '—', '—', '—', '—'],
-        ['M4: CBR-KG', '—', '—', '—', '—', '—', '—', '—'],
-        ['M5: PathTransformer', '—', '—', '—', '—', '—', '—', '—'],
-        ['M6: HGT', '—', '—', '—', '—', '—', '—', '—'],
-        ['M7: CI-HGT (Novel)', '—', '—', '—', '—', '—', '—', '—'],
-        ['M8: KG Ensemble', '—', '—', '—', '—', '—', '—', '—'],
-        ['Benchmark (EW)', '—', '—', '—', '—', '—', '—', '—'],
+        ['M0: XGBoost All',     '2.38',  '5.85',  '6.29',  '62.9%',  '-7.6%',  '8.26',  '61%'],
+        ['M1: XGBoost Causal',  '0.00',  '0.00',  '0.00',  '0.0%',   '0.0%',   '0.00',  '0%'],
+        ['M2: XGBoost Corr',    '3.19',  '8.03',  '8.44',  '103.6%', '-9.9%',  '10.43', '79%'],
+        ['M4: CBR-KG',          '-0.53', '-0.73', '-0.89', '-5.1%',  '-23.6%', '-0.22', '58%'],
+        ['M5: PathTransformer', '-0.22', '-0.43', '0.94',  '-1.3%',  '-15.2%', '-0.08', '50%'],
+        ['M6: HGT',             '1.52',  '2.36',  '4.17',  '37.9%',  '-0.8%',  '50.16', '46%'],
+        ['M7: CI-HGT (Novel)',  '1.50',  '2.32',  '4.08',  '37.1%',  '-0.8%',  '49.18', '46%'],
+        ['M8: KG Ensemble',     '2.45',  '4.91',  '5.87',  '70.9%',  '0.0%',   '∞',     '56%'],
     ]
 
     table = ax.table(cellText=data[1:], colLabels=data[0],
@@ -1062,18 +1066,18 @@ def diagram_backtest_table():
         if row == 0:
             cell.set_facecolor(C['phase2_eval'])
             cell.set_text_props(color='white', fontweight='bold', fontsize=10)
-        elif row in [3, 4, 5, 6, 7]:
-            cell.set_facecolor('#E8F5E9')
+        elif row in [4, 5, 6, 7, 8]:
+            cell.set_facecolor('#E8F5E9')  # Green tint for KG models
         elif row % 2 == 0:
             cell.set_facecolor('#F5F5F5')
         else:
             cell.set_facecolor('white')
 
     ax.text(0.5, 0.03,
-            '— = Fill after running  |  '
-            'Sharpe ratio (Sharpe, 1966)  |  '
-            'Sortino ratio (Sortino & van der Meer, 1991)  |  '
-            'Info Ratio (Grinold & Kahn, 2000)',
+            'M1 shows 0.00: MB/Granger file path was wrong (fixed in v7)  |  '
+            'Sharpe (Sharpe, 1966)  |  '
+            'Sortino (Sortino & van der Meer, 1991)  |  '
+            'IR (Grinold & Kahn, 2000)',
             ha='center', va='center', fontsize=8, fontfamily=FONT,
             color=C['text_light'], transform=ax.transAxes, style='italic')
 
@@ -1240,18 +1244,18 @@ def diagram_multi_method_consensus():
 
     ax.text(8.7, 5.0, 'ICP', ha='center', va='center',
             fontsize=12, fontweight='bold', color=C['novel'], fontfamily=FONT)
-    ax.text(8.7, 4.2, '~12 parents', ha='center', va='center',
+    ax.text(8.7, 4.2, '32 parents', ha='center', va='center',
             fontsize=10, color=C['text_light'], fontfamily=FONT)
 
     ax.text(6.0, 0.8, 'DML', ha='center', va='center',
             fontsize=12, fontweight='bold', color=C['phase2_model'], fontfamily=FONT)
-    ax.text(6.0, 0.2, '27 effects', ha='center', va='center',
+    ax.text(6.0, 0.2, '117 effects', ha='center', va='center',
             fontsize=10, color=C['text_light'], fontfamily=FONT)
 
     # Intersection labels
-    ax.text(5.5, 4.5, 'Granger\n∩ ICP\n1 var', ha='center', va='center',
+    ax.text(5.5, 4.5, 'Granger\n∩ ICP\n3 vars', ha='center', va='center',
             fontsize=9, fontweight='bold', color=C['text'], fontfamily=FONT)
-    ax.text(5.0, 2.8, 'Granger\n∩ DML\n6 vars', ha='center', va='center',
+    ax.text(5.0, 2.8, 'Granger\n∩ DML\n8 vars', ha='center', va='center',
             fontsize=9, fontweight='bold', color=C['text'], fontfamily=FONT)
 
     # Center: all three
